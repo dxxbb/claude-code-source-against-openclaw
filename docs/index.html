@@ -28,43 +28,24 @@
   
     <main class="main-content">
       <div class="content-wrapper markdown-body">
-        <h1>AI Agent Runtime 架构分析</h1>
-        <blockquote>
-          <p>“Agent 的系统级表现不仅源于模型能力，更受其运行时（Runtime）架构设计的制约。”</p>
-        </blockquote>
-        <p>本项目通过对 Claude Code (CC) 与 OpenClaw (OC) 的源码进行对照分析，解析了 AI Agent 在 Session 管理、Context 处理以及执行流控制等关键环节的设计差异。分析重点在于理解不同的工程约束（如本地 CLI 独立环境与分布式网关环境）如何导向不同的架构方案。</p>
-
-        <h2>专题分析目录</h2>
-        <p>下述章节按 Agent 调度的生命周期顺序，拆解了各模块的底层实现细节：</p>
-        
-        <div class="chapter-guide">
-          <ul>
-            <li>
-              <strong><a href="./01-session.html">01 · Session (会话协议)</a></strong>
-              <p>分析用户意图到模型 Context 的映射过程。对比了单通道 CLI 终端与多通道 IM 路由在会话新鲜度（Freshness）判断与状态迁移上的差异。</p>
-            </li>
-            <li>
-              <strong><a href="./02-context.html">02 · Context (上下文治理)</a></strong>
-              <p>探讨如何通过动态/静态边界设计、工具日志 Tombstone 机制以及自动化摘要策略，在维持 Token 预算的同时优化缓存命中率。</p>
-            </li>
-            <li>
-              <strong><a href="./03-loop-engine.html">03 · Loop Engine (执行引擎)</a></strong>
-              <p>分析单轮对话内部的推理迭代逻辑。对比了 CC 的流式并发工具调配与 OC 的 Hook 驱动模型在延迟控制与生命周期管理上的权衡。</p>
-            </li>
-            <li>
-              <strong><a href="./04-subagent.html">04 · Subagent (任务并行)</a></strong>
-              <p>解析任务分叉 (Fork) 与派生 Agent 的生命周期。理解如何通过父子谱系以及独立的 Context 空间实现复杂任务的分解执行。</p>
-            </li>
-            <li>
-              <strong><a href="./05-memory.html">05 · Memory (记忆系统)</a></strong>
-              <p>对比“触发式全量注入”与“检索式增强”两种记忆模型。分析不同数据规模假设下，Session Memory 与长期记忆巩固（Consolidation）的实现路径。</p>
-            </li>
-          </ul>
-        </div>
-
-        <h2>工程取向对照</h2>
-        <p>分析结果表明，**Claude Code** 的架构设计优先考虑“低延迟交互”与“本地环境集成”，通过紧耦合设计优化了反馈循环；而 **OpenClaw** 的设计则侧重于“多租户解耦”与“跨端扩展”，通过分层抽象（Slots & Plugins）提升了系统的适应能力。</p>
-        <p>这些差异展示了在同一技术栈（LLM Agent）下，不同产品定位对底层架构产生的决定性影响。</p>
+        <h1>Claude Code / OpenClaw Agent Runtime 架构导读</h1>
+<blockquote>
+<p><strong>“Agent 的核心是一个 Loop。先把 Loop 和 Context 边界讲清楚，再向下拆解 Session 与 Memory。”</strong></p>
+</blockquote>
+<p>本册子是一份面向高阶开发者的技术剖析，我们深入 <code>v2.1.88</code> 等源码核心，解构了行业领先的 AI Agent —— Claude Code 与 OpenClaw 的执行时逻辑（Runtime）。</p>
+<h2>核心洞察</h2>
+<p>在此前的各种科普中，Agent 被普遍视作一种“能思考循环”的实体。但一旦你深入到工程细节，你会发现大模型的每一次执行上下文才是 Agent 的真正血液。</p>
+<p>本册子分为五个篇章，严格从用户敲击 Enter 键开始，直到 Agent 将结果持久化结束：</p>
+<ul>
+<li><a href="./01-session.html">01 · Session：从用户到模型的映射链</a></li>
+<li><a href="./02-context.html">02 · Context：模型那一端看到的「真相」</a></li>
+<li><a href="./03-loop-engine.html">03 · Loop Engine：一轮对话里到底发生了多少次推理？</a></li>
+<li><a href="./04-subagent.html">04 · Subagent：Claude Code 如何将自己&quot;一分为多&quot;</a></li>
+<li><a href="./05-memory.html">05 · Memory：Agent 的跨对话记忆</a></li>
+</ul>
+<h2>为什么要做这样的解析？</h2>
+<p>你会发现 Claude Code （CC）与 OpenClaw （OC）采用了截然相反的哲学。<br>CC 是一个本地 CLI 工具，极端注重本地上下文的缓存命中率和低延迟交互；<br>而 OC 则是一套基于企业级 IM 体系与多工作流（Workflow）调度理念建立起来的网络态 Agent 运行时。</p>
+<p>两种哲学的碰撞，在 Context 构建和 Subagent 并发隔离上尤为灿烂。在接下来的章节中，我们将为你逐层剥开它们的设计核心。</p>
 
       </div>
     </main>

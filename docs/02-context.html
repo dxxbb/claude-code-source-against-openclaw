@@ -45,30 +45,53 @@
 <h2>Context 窗口的物理布局</h2>
 <p>在讨论&quot;怎么准备&quot;之前，先明确&quot;准备的是什么&quot;——Context 窗口里具体有哪些 Section，它们的顺序和性质是什么。</p>
 <h3>Claude Code：严格分区的线性 Section 数组</h3>
-<p>CC 的 Context 由两个部分组成：<code>system</code>（系统提示数组）和 <code>messages</code>（对话消息列表）。</p>
+<p>CC 的 Context 由<strong>三个物理载体</strong>组成：<code>system</code>（系统提示数组）、<code>tools</code>（工具 Schema 数组，独立顶级参数）和 <code>messages</code>（对话消息列表）。</p>
 <pre><code>┌─────────────────────────────────────────────────────────────────┐
 │                    SYSTEM PROMPT（系统提示数组）                   │
 │                                                                 │
-│  ◆ 静态区 (cacheScope: &#39;global&#39;)  ← 跨 org 共享缓存              │
+│  ◆ 静态区 (cacheScope: &#39;global&#39;)  ← 条件成立时跨 org 共享         │
+│  ├── [Attribution Header]（计费溯源标记）                          │
+│  ├── [CLI Prefix Header]（来源标识）                              │
 │  ├── # Intro（角色定义 + 网络安全指令）                             │
 │  ├── # System（输出格式规则 / Hook 提示 / 无限上下文说明）           │
 │  ├── # Doing tasks（编码规范 / 任务执行规范）                       │
 │  ├── # Executing actions with care（危险操作确认规则）              │
-│  ├── # Using your tools（工具调用优先级 / 并发策略）                 │
+│  ├── # Using your tools（工具调用规则 / 并发策略）                  │
+│  │     注：此 Section 引用工具名称常量，不含具体工具配置，内容稳定     │
 │  ├── # Tone and style（输出风格约束）                              │
 │  └── # Output efficiency（简洁性要求）                            │
 │                                                                 │
 │  ════════ __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ ════════           │
+│  （工程作用：隔离&quot;内容确定&quot;与&quot;内容随会话变化&quot;的 Section）              │
 │                                                                 │
-│  ◆ 动态区 (cacheScope: null)     ← 不缓存，每轮重新生成            │
-│  ├── # Session-specific guidance（按工具集动态生成的行为指引）       │
+│  ◆ 动态区 (cacheScope: null)  ← 会话内相对稳定，但不参与全球缓存    │
+│  ├── # Session-specific guidance                                │
+│  │     此 Section 由多个运行时 bool 条件拼接，含：                  │
+│  │     是否有 Skill 工具、是否非交互 Session、Feature Flag 开关等    │
+│  │     任一条件变 → 文本变 → 缓存 hash 变                          │
+│  │    （这是它被刻意移到 Boundary 后的工程原因，见源码注释）           │
 │  ├── # Memory（用户 CLAUDE.md 的全文注入）                         │
-│  ├── # Environment（CWD / 时间戳 / OS / 模型名）                  │
+│  │     文件内容改变则此块缓存失效                                   │
+│  ├── # Environment（CWD / OS / 模型名 / 会话起始时间）              │
+│  │     含路径等私人信息，刻意不放入 global 以防全网缓存碎片化          │
 │  ├── # Language（用户语言偏好）                                    │
 │  ├── # Output style（如有自定义输出模板）                           │
 │  ├── # MCP Server Instructions（已连接 MCP 服务器的文档）           │
 │  ├── # Scratchpad instructions（思考过程格式约束）                  │
 │  └── … 其他 Feature Flag 控制的可选 Section                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│           TOOLS（工具 Schema 数组，API 请求的独立顶级参数）            │
+│                                                                 │
+│  ├── [内置工具] Bash / FileRead / FileEdit / Glob / Grep ...     │
+│  │     注：即便 API 支持，CC 目前并未为工具数组独立设置缓存标记        │
+│  └── [MCP 工具] mcp__server__tool_name ...（按接入配置动态变化）    │
+│        一旦存在未被 defer 的 MCP 工具，触发降级逻辑：               │
+│        needsToolBasedCacheMarker = true                         │
+│        System Prompt 缓存 &#39;global&#39; 降级为 &#39;org&#39;（组织级）          │
+│        失去全球共享缓存，仅限组织内复用                              │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -100,47 +123,70 @@
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 </code></pre>
-<p><strong>几个关键观察：</strong></p>
+<p><strong>缓存策略的真实决策逻辑（基于源码 <code>claude.ts:1210-1214</code> 和 <code>prompts.ts:343-347</code>）：</strong></p>
 <table>
 <thead>
 <tr>
-<th>Section</th>
-<th align="center">是否每轮变化</th>
-<th align="center">大小量级</th>
-<th align="center">缓存策略</th>
+<th>内容</th>
+<th align="center">缓存作用域</th>
+<th align="left">实际失效条件</th>
 </tr>
 </thead>
 <tbody><tr>
-<td># Doing tasks + 工具 Schema</td>
-<td align="center">否（Session 级稳定）</td>
-<td align="center">50-80KB</td>
-<td align="center"><code>global</code> cache</td>
+<td>静态区 System Prompt（# Intro → # Output efficiency）</td>
+<td align="center"><code>global</code></td>
+<td align="left">CC 版本升级时工程师修改了指令文本</td>
 </tr>
 <tr>
-<td># Memory（CLAUDE.md）</td>
-<td align="center">有时（文件改动时）</td>
-<td align="center">变动大</td>
-<td align="center">不缓存</td>
+<td><code># Session-specific guidance</code></td>
+<td align="center"><code>null</code></td>
+<td align="left">Skill 列表、Session 类型、Feature Flag 等任一变化</td>
 </tr>
 <tr>
-<td># Environment（CWD/时间）</td>
-<td align="center">是（时间戳每轮变）</td>
-<td align="center">&lt; 1KB</td>
-<td align="center">不缓存</td>
+<td><code># Memory</code>（CLAUDE.md）</td>
+<td align="center"><code>null</code></td>
+<td align="left">用户修改了 CLAUDE.md 文件</td>
 </tr>
 <tr>
-<td>system-reminder 里的 gitStatus</td>
-<td align="center">是（git 状态随时变）</td>
-<td align="center">几 KB</td>
-<td align="center">不缓存</td>
+<td><code># Environment</code></td>
+<td align="center"><code>null</code></td>
+<td align="left">含路径等私人信息，设计上不参与全球缓存</td>
+</tr>
+<tr>
+<td>内置工具 Schema（<code>tools</code> 参数）</td>
+<td align="center"><strong>未显式缓存</strong></td>
+<td align="left">每次调用均作为独立参数发送</td>
+</tr>
+<tr>
+<td>MCP 工具 Schema（<code>tools</code> 参数）</td>
+<td align="center"><strong>触发降级</strong></td>
+<td align="left">导致 System Prompt 作用域从 global 变为 org</td>
 </tr>
 <tr>
 <td>Messages 历史</td>
-<td align="center">是（每轮追加）</td>
-<td align="center">累积增长</td>
-<td align="center">由压缩机制管控</td>
+<td align="center">Session 级别缓存断点</td>
+<td align="left">每轮末尾追加新消息或触发压缩</td>
 </tr>
 </tbody></table>
+<p><strong><code>global</code> 缓存的前提条件（源码关键逻辑）：</strong></p>
+<pre><code class="language-typescript">// MCP tools are per-user → dynamic tool section → can&#39;t globally cache.
+const needsToolBasedCacheMarker =
+  useGlobalCacheFeature &amp;&amp;
+  filteredTools.some(t =&gt; t.isMcp === true &amp;&amp; !willDefer(t))
+</code></pre>
+<ul>
+<li><strong>未接入 MCP 工具</strong>：System Prompt 静态区以 <code>scope: &#39;global&#39;</code> 缓存，可跨组织命中（不同用户、不同项目，只要 CC 版本一致均可复用）。注意：前半段（Attribution/Intro）虽被标记为 <code>null</code>，但通过与 <code>staticJoined</code> (global) 的拼接，整体作为一个 Cached Prefix 生效。</li>
+<li><strong>接入了 MCP 工具</strong>（且未被 Tool Search 功能 defer）：由于 MCP 工具是用户私有的，其 Schema 变化无法预测，这会导致 System Prompt 缓存从 <code>global</code> <strong>降级为 <code>org</code>（组织级）</strong>。</li>
+<li><strong>Skill 列表变化</strong>：体现在 <code># Session-specific guidance</code> 的文本内容上，该 Section 在动态区，变化只影响自身的 hash，不破坏静态区缓存。</li>
+</ul>
+<hr>
+<h2>审计发现：消失的工具缓存</h2>
+<p>在对 <code>claude-code/src/services/api/claude.ts</code> 的深度审计中，我们发现了一个有趣的工程细节：</p>
+<p>虽然 Anthropic API 支持对 <code>tools</code> 参数中的工具定义进行独立缓存（通过在最后一个工具 block 添加 <code>cache_control</code>），但 Claude Code 在目前的 <strong>queryModel</strong> 实战链路中<strong>并未启用此项功能</strong>。</p>
+<blockquote>
+<p>[!WARNING]<br><strong>结论</strong>：Claude Code 极其庞大（约 60KB+）的工具 JSON Schema 目前是<strong>每轮请求都全量发送给 API 服务端处理的</strong>。它的成本节省主要来自于 System Prompt 静态区和 Messages 历史的缓存，而非工具定义本身。</p>
+</blockquote>
+<p>这可能是因为 CC 的工具集会根据 <code>ToolSearch</code>、<code>MCP</code> 等状态动态变化，维护一个稳定的、可缓存执的工具数组前缀相对复杂。</p>
 <hr>
 <h3>OpenClaw：扁平化 + 可注入的 Section 结构</h3>
 <p>OC 的系统提示是一个字符串（不是数组），由 <code>buildAgentSystemPrompt()</code> 一次性拼接，Section 顺序固定但内容依赖传入参数按需生成：</p>
