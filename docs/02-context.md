@@ -23,32 +23,55 @@ graph TB
 
 ### Claude Code：严格分区的线性 Section 数组
 
-CC 的 Context 由两个部分组成：`system`（系统提示数组）和 `messages`（对话消息列表）。
+CC 的 Context 由**三个物理载体**组成：`system`（系统提示数组）、`tools`（工具 Schema 数组，独立顶级参数）和 `messages`（对话消息列表）。
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    SYSTEM PROMPT（系统提示数组）                   │
 │                                                                 │
-│  ◆ 静态区 (cacheScope: 'global')  ← 跨 org 共享缓存              │
+│  ◆ 静态区 (cacheScope: 'global')  ← 条件成立时跨 org 共享         │
+│  ├── [Attribution Header]（计费溯源标记）                          │
+│  ├── [CLI Prefix Header]（来源标识）                              │
 │  ├── # Intro（角色定义 + 网络安全指令）                             │
 │  ├── # System（输出格式规则 / Hook 提示 / 无限上下文说明）           │
 │  ├── # Doing tasks（编码规范 / 任务执行规范）                       │
 │  ├── # Executing actions with care（危险操作确认规则）              │
-│  ├── # Using your tools（工具调用优先级 / 并发策略）                 │
+│  ├── # Using your tools（工具调用规则 / 并发策略）                  │
+│  │     注：此 Section 引用工具名称常量，不含具体工具配置，内容稳定     │
 │  ├── # Tone and style（输出风格约束）                              │
 │  └── # Output efficiency（简洁性要求）                            │
 │                                                                 │
 │  ════════ __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ ════════           │
+│  （工程作用：隔离"内容确定"与"内容随会话变化"的 Section）              │
 │                                                                 │
-│  ◆ 动态区 (cacheScope: null)     ← 不缓存，每轮重新生成            │
-│  ├── # Session-specific guidance（按工具集动态生成的行为指引）       │
+│  ◆ 动态区 (cacheScope: null)  ← 会话内相对稳定，但不参与全球缓存    │
+│  ├── # Session-specific guidance                                │
+│  │     此 Section 由多个运行时 bool 条件拼接，含：                  │
+│  │     是否有 Skill 工具、是否非交互 Session、Feature Flag 开关等    │
+│  │     任一条件变 → 文本变 → 缓存 hash 变                          │
+│  │    （这是它被刻意移到 Boundary 后的工程原因，见源码注释）           │
 │  ├── # Memory（用户 CLAUDE.md 的全文注入）                         │
-│  ├── # Environment（CWD / 时间戳 / OS / 模型名）                  │
+│  │     文件内容改变则此块缓存失效                                   │
+│  ├── # Environment（CWD / OS / 模型名 / 会话起始时间）              │
+│  │     含路径等私人信息，刻意不放入 global 以防全网缓存碎片化          │
 │  ├── # Language（用户语言偏好）                                    │
 │  ├── # Output style（如有自定义输出模板）                           │
 │  ├── # MCP Server Instructions（已连接 MCP 服务器的文档）           │
 │  ├── # Scratchpad instructions（思考过程格式约束）                  │
 │  └── … 其他 Feature Flag 控制的可选 Section                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│           TOOLS（工具 Schema 数组，API 请求的独立顶级参数）            │
+│                                                                 │
+│  ├── [内置工具] Bash / FileRead / FileEdit / Glob / Grep ...     │
+│  │     内置工具 Schema 固定不变，顺序稳定，是缓存命中的最优候选        │
+│  └── [MCP 工具] mcp__server__tool_name ...（按接入配置动态变化）    │
+│        一旦存在未被 defer 的 MCP 工具，触发降级逻辑：               │
+│        needsToolBasedCacheMarker = true                         │
+│        System Prompt 缓存 'global' 降级为 'org'（组织级）          │
+│        失去全球共享缓存，仅限组织内复用                              │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -81,15 +104,30 @@ CC 的 Context 由两个部分组成：`system`（系统提示数组）和 `mess
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**几个关键观察：**
+**缓存策略的真实决策逻辑（基于源码 `claude.ts:1210-1214` 和 `prompts.ts:343-347`）：**
 
-| Section | 是否每轮变化 | 大小量级 | 缓存策略 |
-|---------|:---:|:---:|:---:|
-| # Doing tasks + 工具 Schema | 否（Session 级稳定） | 50-80KB | `global` cache |
-| # Memory（CLAUDE.md） | 有时（文件改动时） | 变动大 | 不缓存 |
-| # Environment（CWD/时间） | 是（时间戳每轮变） | < 1KB | 不缓存 |
-| system-reminder 里的 gitStatus | 是（git 状态随时变） | 几 KB | 不缓存 |
-| Messages 历史 | 是（每轮追加） | 累积增长 | 由压缩机制管控 |
+| 内容 | 缓存作用域 | 实际失效条件 |
+|------|:---:|:---|
+| 静态区 System Prompt（# Intro → # Output efficiency） | `global`（有条件，见下） | CC 版本升级时工程师修改了指令文本 |
+| `# Session-specific guidance` | `null` | Skill 列表、Session 类型、Feature Flag 等任一变化 |
+| `# Memory`（CLAUDE.md） | `null` | 用户修改了 CLAUDE.md 文件 |
+| `# Environment` | `null` | 含路径等私人信息，设计上不参与全球缓存 |
+| 内置工具 Schema（`tools` 参数前段） | 受 `tools` 参数整体缓存机制管控 | CC 版本升级导致 Schema 文本变化 |
+| MCP 工具 Schema（`tools` 参数后段） | 触发 System Prompt 缓存降级至 `org` | MCP 服务端工具列表变化 |
+| Messages 历史 | Session 级别缓存断点（仅末尾一条） | 每轮末尾追加新消息 |
+
+**`global` 缓存的前提条件（源码关键逻辑）：**
+
+```typescript
+// MCP tools are per-user → dynamic tool section → can't globally cache.
+const needsToolBasedCacheMarker =
+  useGlobalCacheFeature &&
+  filteredTools.some(t => t.isMcp === true && !willDefer(t))
+```
+
+- **未接入 MCP 工具**：System Prompt 静态区以 `scope: 'global'` 缓存，可跨组织命中（不同用户、不同项目，只要 CC 版本一致均可复用）。
+- **接入了 MCP 工具**（且未被 Tool Search 功能 defer）：缓存从 `global` **降级为 `org`（组织级）**，失去全网共享收益。
+- **Skill 列表变化**：体现在 `# Session-specific guidance` 的文本内容上，该 Section 在动态区，变化只影响自身的 hash，不破坏静态区缓存。
 
 ---
 
