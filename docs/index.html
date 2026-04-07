@@ -28,43 +28,43 @@
   
     <main class="main-content">
       <div class="content-wrapper markdown-body">
-        <h1>Claude Code vs OpenClaw：AI Agent 架构深度解剖</h1>
+        <h1>AI Agent Runtime 架构深度解析</h1>
         <blockquote>
-          <p><strong>这是一份写给开发者的实战导读。我们不谈虚幻的概念，只从真实的工业级源码出发，带你拆解 Agent 真正的运行时（Runtime）奥秘。</strong></p>
+          <p>“在工业级场景下，Agent 的可靠性不只取决于模型，更取决于其运行时的设计模式。”</p>
         </blockquote>
-        <p>欢迎来到这个研究项目！如果你正在思考如何构建一个可靠、高效且具备商业竞争力的 AI Agent，那么深入理解 **Claude Code** 与 **OpenClaw** 的架构差异将为你提供极其宝贵的参考。</p>
+        <p>本项目通过对 Claude Code (CC) 与 OpenClaw (OC) 的源码级比对，系统性地梳理了 AI Agent 在实际运行过程中面临的核心挑战与解决方案。这不仅仅是一份源码审计，更是一场关于“本地化效率”与“分布式扩展”的设计哲学探讨。</p>
 
-        <h2>💡 你将从这里获得什么？</h2>
-        <p>我们没有罗列代码，而是将繁杂的源码抽象成了五个关键维度，帮助你一窥顶级 Agent 的“大脑”是如何工作的：</p>
+        <h2>专题目录</h2>
+        <p>分析内容按 Agent 调度的生命周期分为以下五个维度，旨在揭示那些被 API 抽象所掩盖的技术细节：</p>
         
         <div class="chapter-guide">
           <ul>
             <li>
-              <strong><a href="./01-session.html">01 · Session (会话管理)</a></strong>
-              <p>学习如何处理从 IM 消息到模型输入之间的映射，搞定多轮对话的上下文隔离与恢复。</p>
+              <strong><a href="./01-session.html">01 · Session (会话协议)</a></strong>
+              <p>剖析从用户意图到模型 Context 的映射链条。对比单通道 CLI 与多通道网关在会话新鲜度与路由策略上的差异。</p>
             </li>
             <li>
-              <strong><a href="./02-context.html">02 · Context (上下文工程)</a></strong>
-              <p>看工业级产品如何利用 Prompt Cache、精准截断与自动摘要，在控制 API 成本的同时最大化模型能力。</p>
+              <strong><a href="./02-context.html">02 · Context (上下文治理)</a></strong>
+              <p>探讨如何通过动态/静态边界、Tombstone 机制以及自动化摘要策略，在保持长周期对话能力的同时优化 Prompt 缓存效率。</p>
             </li>
             <li>
-              <strong><a href="./03-loop-engine.html">03 · Loop Engine (运行循环)</a></strong>
-              <p>解析 Agent 的“思考-行动”循环逻辑。理解为什么有时候模型会陷入死循环，以及如何优雅地跳出。</p>
+              <strong><a href="./03-loop-engine.html">03 · Loop Engine (执行引擎)</a></strong>
+              <p>深入 Loop 底层，拆解流式工具执行的并发控制、级联中止策略以及模型截断后的自动恢复机制。</p>
             </li>
             <li>
-              <strong><a href="./04-subagent.html">04 · Subagent (任务分发)</a></strong>
-              <p>看 Claude Code 这种单体 CLI 是如何通过派生子智能体来处理并行任务和复杂排查的。</p>
+              <strong><a href="./04-subagent.html">04 · Subagent (协作架构)</a></strong>
+              <p>解构任务分叉 (Fork) 与派生智能体的生命周期管理，理解如何通过父子谱系实现复杂的排查与执行流。</p>
             </li>
             <li>
-              <strong><a href="./05-memory.html">05 · Memory (长期记忆)</a></strong>
-              <p>探索记忆是如何从碎片化的日志变成结构化的知识，并最终反哺模型决策的。</p>
+              <strong><a href="./05-memory.html">05 · Memory (记忆系统)</a></strong>
+              <p>对比“无意识全量注入”与“检索式增强”两种记忆模型。理解 Session Memory 作为 Compaction 补偿机制的设计初衷。</p>
             </li>
           </ul>
         </div>
 
-        <h2>📖 两种哲学的碰撞</h2>
-        <p>在阅读过程中，你会发现：<br><strong>Claude Code (CC)</strong> 追求的是极致的本地响应和开发深度；<br>而 <strong>OpenClaw (OC)</strong> 追求的是多端协同的广度和企业级调度的灵活性。</p>
-        <p>理解这两种哲学的异同，将帮助你在自己的项目中做出最合适的技术布局。点击左侧菜单，开始你的架构探索之旅吧！</p>
+        <h2>设计哲学对照</h2>
+        <p>通过对比你会发现，**Claude Code** 的设计核心是“极简与低延迟”，它通过深度耦合本地环境来榨取性能；而 **OpenClaw** 的设计核心是“解耦与扩展”，它通过标准化的接口和 Hook 机制来实现企业级的灵活性。</p>
+        <p>理解这两种截然不同的技术取向，将有助于你在构建自己的 Agent 系统时，做出更符合业务场景的决策。</p>
 
       </div>
     </main>
