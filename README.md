@@ -19,7 +19,7 @@
 
 我们为你准备了五个极具启发性的章节，点击下方链接即可通过 GitHub Pages 获取更佳的阅读体验：
 
-👉 **[在线文档入口 (正在发布中...)](#)** 👈
+👉 **[在线文档入口 (GitHub Pages)](https://dxxbb.github.io/claude-code-source-against-openclaw/)** 👈
 
 ### 章节速览：
 1. **[01 · Session](docs/01-session.md)**：彻底搞懂消息是如何从用户输入变成模型能理解的消息队列。
