@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>05 Memory：Agent 的持久化记忆</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="docs-container">
+      <aside class="sidebar">
+        <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+        <nav>
+          <ul>
+            <li class="nav-item"><a href="index.html" class="nav-link">00 · 导引</a></li>
+            <li class="nav-item"><a href="index.html#core-loop" class="nav-link">01 · 主循环总图</a></li>
+            <li class="nav-item"><a href="session.html" class="nav-link">01 · Session 边界</a></li>
+            <li class="nav-item"><a href="context.html" class="nav-link">02 · Context 组装</a></li>
+            <li class="nav-item"><a href="loop-engine.html" class="nav-link">03 · 回合引擎</a></li>
+            <li class="nav-item"><a href="subagent.html" class="nav-link">04 · 子代理/Fork</a></li>
+            <li class="nav-item"><a href="memory.html" class="nav-link active">05 · 记忆与收尾</a></li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="main-content">
+        <div class="content-wrapper">
+          <header>
+            <h1>05 Memory：跨对话的持久化记忆</h1>
+            <p class="epigraph">
+              “Agent 重启后、或者开始新对话时，怎么知道之前学过什么？Memory 指的是那些能被 Agent 在未来的对话中重新获取的持久化知识。”
+            </p>
+          </header>
+
+          <section id="philosophy">
+            <h2>CC 与 OC 的记忆哲学</h2>
+            <p>在 Memory 的设计上，两个系统基于不同的“记忆体量假设”做出了相反的选择：</p>
+            
+            <table>
+              <thead>
+                <tr>
+                  <th>维度</th>
+                  <th>Claude Code (CC)</th>
+                  <th>OpenClaw (OC)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>记忆类型</strong></td>
+                  <td>无意识记忆 (程序性)</td>
+                  <td>有意识记忆 (陈述性)</td>
+                </tr>
+                <tr>
+                  <td><strong>获取方式</strong></td>
+                  <td><strong>全量注入</strong> System Prompt</td>
+                  <td><strong>主动检索</strong> (Vector DB)</td>
+                </tr>
+                <tr>
+                  <td><strong>适用场景</strong></td>
+                  <td>单人、单项目 (KB 级)</td>
+                  <td>多租户、多 Agent (GB 级)</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div class="key-insight">
+              <strong>为什么 CC 可以全量注入？</strong> 因为对于单项目而言，项目规约和核心认知通常只有几千行 Markdown。将其全量注入 System Prompt 比实现一个复杂的 RAG 检索器更可靠且低延迟。
+            </div>
+          </section>
+
+          <section id="cc-layers">
+            <h2>Claude Code 的三层记忆体系</h2>
+            
+            <div class="mermaid-box">
+              <pre class="mermaid">
+sequenceDiagram
+    participant Main as 主循环结束
+    participant SM as Session Memory (WAL)
+    participant EM as extractMemories (L0)
+    participant AD as AutoDream (Compaction)
+    
+    Main->>SM: 写入临时笔记 (对抗压缩损耗)
+    Main->>EM: 提炼持久 Markdown (LSM 写入)
+    Main->>AD: 周期性合并与去重 (24h/5-Session)
+              </pre>
+            </div>
+
+            <h3>1. Session Memory: 对抗有损压缩</h3>
+            <p><strong>WAL 模式</strong>。由于 Context Compaction 是有损的，系统会在压缩发生前，将可能有用的细节预写到 Session Memory 中，作为“生存保障”。</p>
+
+            <h3>2. extractMemories: 提炼持久共识</h3>
+            <p><strong>LSM-tree L0 写入</strong>。每一轮任务结束，Fork 一个子代理扫描对话，提取“项目知识”并追加到 <code>memory/*.md</code>。它只管追加，不管去重。</p>
+
+            <h3>3. AutoDream: 跨周期的“梦境”巩固</h3>
+            <p><strong>LSM Compaction</strong>。由三重门控驱动（≥24小时、≥5个新 Session、无并发锁）。读取全量历史，进行全局的逻辑合并与去重。这是整套系统中最昂贵的操作。</p>
+          </section>
+
+          <section id="patterns">
+            <h2>可迁移的设计模式</h2>
+            <ul>
+              <li><strong>WAL 模式</strong>: 在不可避免的信息损失点前，开辟独立通道保护关键信息。</li>
+              <li><strong>写读分离</strong>: 写入频率高、读取频率低且支持全量时，选择“先追加、后合并”策略。</li>
+              <li><strong>渐进式门控</strong>: 面对高昂操作（LLM 费用），使用一系列从 CPU 负载到 I/O、最后再到 LLM 的成本过滤器。</li>
+            </ul>
+          </section>
+
+          <section id="sources">
+            <h2>关键源码定位</h2>
+            <ul>
+              <li><strong>持久记忆提炼</strong>: <code>extractMemories.ts#L1</code></li>
+              <li><strong>Session 笔记触发</strong>: <code>sessionMemory.ts#L134</code></li>
+              <li><strong>梦境巩固逻辑</strong>: <code>autoDream.ts#L122</code></li>
+              <li><strong>OC 记忆插槽</strong>: <code>slots.ts#L17</code> (memory-core)</li>
+            </ul>
+          </section>
+
+          <footer>
+            <p>05 Memory Chapter · Claude Code vs OpenClaw Architecture Guide</p>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+  </body>
+</html>

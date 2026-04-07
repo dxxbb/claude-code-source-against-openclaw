@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>04-Subagent</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="docs-container">
+    
+    <aside class="sidebar">
+      <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+      <nav>
+        <ul>
+          <li class="nav-item">
+            <a href="index.html" class="nav-link ">00 · 导言</a>
+          </li>
+            <li class="nav-item"><a href="01-session.html" class="nav-link ">01 · Session</a></li>
+          <li class="nav-item"><a href="02-context.html" class="nav-link ">02 · Context</a></li>
+          <li class="nav-item"><a href="03-loop-engine.html" class="nav-link ">03 · Loop Engine</a></li>
+          <li class="nav-item"><a href="04-subagent.html" class="nav-link active">04 · Subagent</a></li>
+          <li class="nav-item"><a href="05-memory.html" class="nav-link ">05 · Memory</a></li>
+
+        </ul>
+      </nav>
+    </aside>
+  
+    <main class="main-content">
+      <div class="content-wrapper markdown-body">
+        <h1>第4章：子代理与多 Agent——Claude Code 如何将自己&quot;一分为多&quot;</h1>
+<blockquote>
+<p><strong>核心问题</strong>：当一个任务需要并行推进、需要保护主上下文不被淹没、或者需要一个独立视角来验证自己的工作时，Agent 是如何从一个单一进程变成一套协作体系的？Claude Code 和 OpenClaw 在这里给出了截然不同的答案。</p>
+</blockquote>
+<hr>
+<h2>0. 起点：两套不同的哲学</h2>
+<p>在开始看代码之前，先把两个系统的核心理念说清楚：</p>
+<p><strong>Claude Code：一切皆子代理（subagent-centric）</strong>。CC 的多 Agent 策略建立在一个统一原语上：<code>AgentTool</code>（即 <code>Task</code> 工具）。无论是并行搜索、自动验证还是多工作流并行，都是这个 Tool 的不同路径。系统提示、工具池、权限模式——子代理启动时按需组装，互相隔离。</p>
+<p><strong>OpenClaw：Coordinator-Worker 模型（coordinator-centric）</strong>。OC 引入了一个明确的角色分工：有一个专门的 Coordinator 实例，负责任务拆解、派发指令、汇总结果；Worker 实例只负责执行具体工作。两者通过消息通道通信，Worker 完成后发来 <code>&lt;task-notification&gt;</code> XML，Coordinator 收到后决定下一步。</p>
+<p>这两种哲学的分歧，体现在架构的每一个细节里。</p>
+<hr>
+<h2>1. CC 的三种 Agent 创建模式</h2>
+<p>在 CC 里，&quot;派 Agent&quot;这一个动作，对应三条完全不同的执行路径（<code>AgentTool.tsx#L318-L356</code>）：</p>
+<pre><code class="language-mermaid">graph TD
+    A[&quot;调用 AgentTool&quot;] --&gt; B{subagent_type?}
+    B -- &quot;省略 + Fork gate 开启&quot; --&gt; C[&quot;🍴 Fork 路径&lt;br/&gt;继承父 Agent 全部上下文&quot;]
+    B -- &quot;指定类型&quot; --&gt; D{name + team_name?}
+    D -- &quot;是&quot; --&gt; E[&quot;👥 多代理团队路径&lt;br/&gt;spawnTeammate() 起新进程&quot;]
+    D -- &quot;否&quot; --&gt; F[&quot;🎯 显性功能子代理路径&lt;br/&gt;独立系统提示 + 裁剪工具池&quot;]
+    
+    style C fill:#fce4ec,stroke:#e91e63
+    style E fill:#e3f2fd,stroke:#1565c0
+    style F fill:#e8f5e9,stroke:#2e7d32
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>触发条件</th>
+<th>Context 来源</th>
+<th>AbortController</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Fork 子代理</td>
+<td><code>subagent_type</code> 省略 + gate 开启</td>
+<td>继承父代理完整对话 + 占位 tool_result</td>
+<td>独立（异步）</td>
+</tr>
+<tr>
+<td>功能子代理</td>
+<td>指定 <code>subagent_type</code></td>
+<td>独立系统提示 + 新的 user message</td>
+<td>继承（同步）或独立（异步）</td>
+</tr>
+<tr>
+<td>多代理团队</td>
+<td><code>name</code> + <code>team_name</code> 都存在</td>
+<td>新进程，完全独立</td>
+<td>进程级隔离</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>2. Fork 子代理：Prompt Cache 共享的工程极致</h2>
+<p>Fork 是三条路径里工程最精妙的一条。</p>
+<h3>2.1 为什么要 Fork？</h3>
+<p>当主 Agent 在一轮里需要并行执行多个独立任务，最直观的做法是 spawn 多个功能子代理，每个拿一个全新的系统提示、从零开始对话。但这意味着每个子代理都会独占一个 Prompt Cache 槽位——60KB+ 的工具定义在每个子代理身上各缓存一份。</p>
+<p>Fork 的设计目标正是为了消灭这种浪费：<strong>让同时 fork 出的多个子代理，共享同一个 Prompt Cache 槽位。</strong></p>
+<h3>2.2 消息构造：占位符是整个设计的关键</h3>
+<p><code>buildForkedMessages()</code> 函数（<code>forkSubagent.ts#L107</code>）构造的消息结构是：</p>
+<pre><code>[...父代理历史]
+→ [父代理当前的 AssistantMessage（含所有 tool_use 块）]
+→ [User message：占位 tool_result × N + 末尾的任务指令 text block]
+</code></pre>
+<p><strong>关键约束</strong>：父代理在一轮里可能同时 fork 出 A、B、C 三个子代理，每个的任务指令不同。如果每个子代理产生的 API 请求有任何字节差异，它们就无法共享缓存。</p>
+<p>解决方案：</p>
+<pre><code class="language-typescript">const FORK_PLACEHOLDER_RESULT = &#39;Fork started — processing in background&#39;
+</code></pre>
+<p>所有 <code>tool_use</code> 块都用<strong>完全相同</strong>的占位文字作为 <code>tool_result</code>。所有子代理看到的 <code>toolResultBlocks</code> 都是字节相同的。<strong>只有最末尾那个额外的 text block（即具体的任务指令）是不同的</strong>。</p>
+<p>结果：<code>[通用历史 + 相同 placeholder results]</code> 这部分所有 Fork 子代理全部命中缓存，只有 directive 那一块不缓存。</p>
+<h3>2.3 系统提示的字节级继承</h3>
+<p>Fork 子代理还有另一个反直觉的设计（<code>runAgent.ts#L508-L518</code>）：</p>
+<pre><code class="language-typescript">// Fork 路径：直接传递父代理已渲染的系统提示字节
+const agentSystemPrompt = override?.systemPrompt
+  ? override.systemPrompt  // ← Fork 路径走这里
+  : asSystemPrompt(await getAgentSystemPrompt(...))  // ← 正常路径
+</code></pre>
+<p>Fork 子代理不重新调用 <code>getSystemPrompt()</code> 重建系统提示，而是直接传递父代理 <code>renderedSystemPrompt</code> 的字节副本。</p>
+<p>原因：<code>getSystemPrompt()</code> 内部有 GrowthBook feature gate 的读取，它的&quot;冷&quot;和&quot;暖&quot;状态可能不同（Session 开始时读磁盘缓存，一段时间后从远程获取新值）。如果重新构建，子代理的系统提示字节可能与父代理的微小不同，导致 Prompt Cache miss。</p>
+<h3>2.4 防递归的两道防护</h3>
+<p>Fork 子代理保留了父代理的完整工具列表（包括 AgentTool 本身），以保证工具定义字节相同。但这带来了无限递归的风险。</p>
+<p>CC 用两道防护阻止（<code>AgentTool.tsx#L326-L334</code>）：</p>
+<ol>
+<li><p><strong>querySource 检查</strong>（主要防护，AutoCompact 安全）：Fork 子代理的 <code>toolUseContext.options.querySource</code> 被设置为 <code>agent:builtin:fork</code>。这个值存在 context.options 里，即使 AutoCompact 把消息历史全部重写，这个标识也不会消失。</p>
+</li>
+<li><p><strong>消息扫描</strong>（兜底防护）：扫描历史消息里是否包含 <code>&lt;fork-boilerplate&gt;</code> 标签。Fork 子代理任务开头会注入这段文字，因此可以通过历史消息检测。</p>
+</li>
+</ol>
+<p>这也是 <code>buildChildMessage()</code> 的开头为什么有那段&quot;戏剧化&quot;的告知：</p>
+<pre><code>STOP. READ THIS FIRST.
+You are a forked worker process. You are NOT the main agent.
+RULES (non-negotiable):
+1. Your system prompt says &quot;default to forking.&quot; IGNORE IT — that&#39;s for the parent.
+   You ARE the fork. Do NOT spawn sub-agents; execute directly.
+</code></pre>
+<p>这不是在对模型说废话——这是<strong>提示词层面的防护</strong>，配合 querySource 和标签扫描，构成三层递归防卫。</p>
+<hr>
+<h2>3. 功能子代理：精心裁剪的独立世界</h2>
+<p>显性功能子代理拥有完全独立的上下文，从 CC 的内置 Agent 库里选取。</p>
+<h3>3.1 工具池的权限裁剪</h3>
+<p>每个内置 Agent 的工具权限在定义里写死，体现了&quot;按最小特权原则&quot;设计子 Agent：</p>
+<table>
+<thead>
+<tr>
+<th>Agent</th>
+<th>禁用的工具</th>
+<th>开放的工具</th>
+<th>设计意图</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Explore</strong></td>
+<td>AgentTool, FileEdit, FileWrite, NotebookEdit</td>
+<td>FileRead, Glob, Grep, Bash（只读）</td>
+<td>只搜索，禁修改</td>
+</tr>
+<tr>
+<td><strong>Verification</strong></td>
+<td>AgentTool, FileEdit, FileWrite, NotebookEdit</td>
+<td>Bash（可写 /tmp）</td>
+<td>只验证，禁改项目文件</td>
+</tr>
+<tr>
+<td><strong>Fork</strong></td>
+<td>无禁用</td>
+<td><code>[&#39;*&#39;]</code>（继承全部）</td>
+<td>字节相同前缀 + cache 命中</td>
+</tr>
+<tr>
+<td><strong>Plan</strong></td>
+<td>AgentTool, FileEdit, FileWrite</td>
+<td>FileRead, Bash（只读）</td>
+<td>只制定计划</td>
+</tr>
+</tbody></table>
+<p>Verification Agent 允许写 <code>/tmp</code> 的权限是有意为之——验证者可能需要写测试脚本、编译临时文件，但绝不应该修改项目本身。</p>
+<h3>3.2 Context 精细裁剪</h3>
+<p>功能子代理的 Context 裁剪是 Token 成本的核心杠杆（<code>runAgent.ts#L385-L410</code>）：</p>
+<p><strong>CLAUDE.md 剥离</strong>（Explore 和 Plan Agent）：</p>
+<pre><code class="language-typescript">const shouldOmitClaudeMd =
+  agentDefinition.omitClaudeMd &amp;&amp;
+  !override?.userContext &amp;&amp;
+  getFeatureValue_CACHED_MAY_BE_STALE(&#39;tengu_slim_subagent_claudemd&#39;, true)
+</code></pre>
+<p>注释里写得很直接：<em>&quot;Dropping claudeMd here saves ~5-15 Gtok/week across 34M+ Explore spawns.&quot;</em></p>
+<p>CLAUDE.md 包含项目规约、提交规范、lint 规则——这些对只做搜索的 Explore Agent 毫无意义，但会消耗宝贵的 Token 预算。</p>
+<p><strong>git status 剥离</strong>（Explore 和 Plan Agent）：</p>
+<pre><code class="language-typescript">const resolvedSystemContext =
+  agentDefinition.agentType === &#39;Explore&#39; || agentDefinition.agentType === &#39;Plan&#39;
+    ? systemContextNoGit
+    : baseSystemContext
+</code></pre>
+<p>Session 启动时采集的 git status 快照可达 40KB，且明确标注是 stale 的。搜索型 Agent 如果需要 git 信息，直接运行 <code>git status</code> 拿新鲜数据即可。</p>
+<h3>3.3 Verification Agent：对抗自身 LLM 倾向的系统设计</h3>
+<p>Verification Agent 的系统提示是整个 CC 代码库里最值得研读的文字之一，它直接命名了两个 LLM 在自我验证时的失败模式：</p>
+<blockquote>
+<p><strong>验证回避</strong>：无论面对什么检查，都能找到不运行的理由——读代码、描述应该测试什么、写 &quot;PASS&quot;，然后继续。</p>
+<p><strong>被前 80% 诱惑</strong>：看到精美的 UI 或通过的测试套件就觉得可以放行，没注意到有一半按钮什么也不做，刷新后状态消失，或者后端在边界输入时崩溃。</p>
+</blockquote>
+<p>解决方案是<strong>强制证据化输出格式</strong>：</p>
+<pre><code>### Check: [验证点]
+**Command run:** [实际执行的命令]
+**Output observed:** [终端输出原文，不要解释]
+**Result: PASS** (或 FAIL — 附 Expected vs Actual)
+</code></pre>
+<p><strong>没有 <code>Command run</code> 的 PASS 会被拒绝。</strong></p>
+<pre><code>// Bad (rejected):
+### Check: POST /api/register validation
+**Result: PASS**
+Evidence: Reviewed the route handler. The logic correctly validates email format...
+(没有命令输出，读代码不算验证)
+</code></pre>
+<p>主代理在收到报告后还会<strong>抽查</strong>：随机 re-run 报告里 2-3 条命令，检查输出是否匹配。这是更高层面的验证——验证&quot;验证报告&quot;本身是否诚实。</p>
+<hr>
+<h2>4. CC 多 Agent 体系：Coordinator 模式与 Agent 团队</h2>
+<h3>4.1 Coordinator 模式</h3>
+<p>CC 提供了一个企业级的多 Agent 编排模式：通过环境变量 <code>CLAUDE_CODE_COORDINATOR_MODE=1</code> 激活。在这个模式下，主 Agent 的角色完全改变（<code>coordinatorMode.ts#L111</code>）：</p>
+<p>Coordinator 的系统提示开头：</p>
+<pre><code>You are Claude Code, an AI assistant that orchestrates software engineering tasks 
+across multiple workers.
+
+## 1. Your Role
+You are a coordinator. Your job is to:
+- Help the user achieve their goal
+- Direct workers to research, implement and verify code changes
+- Synthesize results and communicate with the user
+</code></pre>
+<p>Coordinator 的工具集被专门定制：</p>
+<ul>
+<li><strong>AgentTool</strong> — 派发新 Worker</li>
+<li><strong>SendMessageTool</strong> — 继续既有的 Worker（发送后续指令）</li>
+<li><strong>TaskStopTool</strong> — 中止运行中的 Worker</li>
+<li>没有 FileEdit, FileWrite, Bash——Coordinator <strong>不直接修改文件</strong></li>
+</ul>
+<p>Worker 结果以 <code>&lt;task-notification&gt;</code> XML 的形式作为 user 消息到达 Coordinator：</p>
+<pre><code class="language-xml">&lt;task-notification&gt;
+  &lt;task-id&gt;agent-a1b&lt;/task-id&gt;
+  &lt;status&gt;completed&lt;/status&gt;
+  &lt;summary&gt;Agent &quot;Investigate auth bug&quot; completed&lt;/summary&gt;
+  &lt;result&gt;Found null pointer in src/auth/validate.ts:42...&lt;/result&gt;
+  &lt;usage&gt;
+    &lt;total_tokens&gt;4521&lt;/total_tokens&gt;
+    &lt;tool_uses&gt;8&lt;/tool_uses&gt;
+    &lt;duration_ms&gt;12480&lt;/duration_ms&gt;
+  &lt;/usage&gt;
+&lt;/task-notification&gt;
+</code></pre>
+<h3>4.2 Coordinator 内置的并发哲学</h3>
+<p>Coordinator 系统提示里有一段非常明确的并发指导原则：</p>
+<blockquote>
+<p><strong>Parallelism is your superpower. Workers are async. Launch independent workers concurrently whenever possible — don&#39;t serialize work that can run simultaneously and look for opportunities to fan out.</strong></p>
+</blockquote>
+<p>并发管理规则：</p>
+<ul>
+<li><strong>只读任务</strong>（研究）：自由并行</li>
+<li><strong>写入任务</strong>（实现）：同一批文件一次只有一个 Worker</li>
+<li><strong>验证任务</strong>：可与不同文件区域的实现并行</li>
+</ul>
+<p>&quot;Continue vs Spawn&quot; 的决策框架也被明确写入 Coordinator 提示：</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>策略</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>研究覆盖了将要编辑的文件</td>
+<td><strong>Continue</strong>（SendMessage）</td>
+<td>Worker 已加载文件，现在给它明确计划</td>
+</tr>
+<tr>
+<td>研究范围宽泛但实现很聚焦</td>
+<td><strong>Spawn fresh</strong>（AgentTool）</td>
+<td>避免拖走探索阶段的噪音；聚焦的 Context 更干净</td>
+</tr>
+<tr>
+<td>纠正失败或扩展最近的工作</td>
+<td><strong>Continue</strong></td>
+<td>Worker 有错误 Context，知道刚才尝试了什么</td>
+</tr>
+<tr>
+<td>验证另一个 Worker 刚写的代码</td>
+<td><strong>Spawn fresh</strong></td>
+<td>验证者应该以新鲜视角看代码，不带实现阶段的假设</td>
+</tr>
+</tbody></table>
+<h3>4.3 Agent 团队（Swarms）：进程级并行</h3>
+<p>当 <code>name</code> 和 <code>team_name</code> 都存在时，CC 走的是进程级多 Agent 路径，通过 <code>spawnTeammate()</code> 在 tmux 新窗口起一个独立的 CC 进程。</p>
+<p>团队中的 Agent 通过<strong>文件系统邮箱（mailbox）系统</strong>通信：</p>
+<pre><code>~/.claude/teams/&lt;teamName&gt;/mailboxes/&lt;agentName&gt;.json
+</code></pre>
+<p>每个 Agent 持续 poll 自己的邮箱（500ms 间隔）。权限确认请求通过邮箱发给 Leader，Leader 通过 UI 按钮回复 allow/reject。响应也写回邮箱，Worker 拿到响应后继续。</p>
+<pre><code class="language-mermaid">graph LR
+    L[&quot;👑 Leader (主进程)&quot;] 
+    W1[&quot;👷 Worker A (tmux)&quot;]
+    W2[&quot;👷 Worker B (tmux)&quot;]
+    
+    L --&gt;|&quot;派任务 via AgentTool&quot;| W1
+    L --&gt;|&quot;派任务 via AgentTool&quot;| W2
+    W1 --&gt;|&quot;idle notification 写入 Leader 邮箱&quot;| L
+    W2 --&gt;|&quot;idle notification&quot;| L
+    W1 &lt;--&gt;|&quot;권限 请求/响应 via 邮箱&quot;| L
+</code></pre>
+<p>进程级隔离的关键特性：</p>
+<ul>
+<li>Worker 的 AbortController 独立于 Leader——Leader 按 ESC 不会杀 Worker</li>
+<li>Worker 有独立的缓冲区，AutoCompact 各自触发</li>
+<li>但文件系统是共享的（默认情况下），写冲突风险真实存在</li>
+</ul>
+<h3>4.4 Worktree 隔离：文件系统级隔离</h3>
+<p>为了解决并行 Worker 的写冲突，CC 提供了 <code>isolation: &#39;worktree&#39;</code> 参数：</p>
+<pre><code class="language-typescript">if (effectiveIsolation === &#39;worktree&#39;) {
+  const slug = `agent-${earlyAgentId.slice(0, 8)}`
+  worktreeInfo = await createAgentWorktree(slug)
+}
+</code></pre>
+<p>每个 Worker 在独立的 git worktree 里操作，拥有相同代码库的不同工作副本。完成后，如果没有任何变更，worktree 自动删除；如果有变更，保留供用户合并。</p>
+<p>Fork + Worktree 组合时，系统还会注入路径翻译提示：</p>
+<pre><code>You&#39;ve inherited the conversation context above from a parent agent working in /Users/xxx/project.
+You are operating in an isolated git worktree at /Users/xxx/project-agent-a1b3c5de — 
+same repository, same relative file structure, separate working copy. 
+Paths in the inherited context refer to the parent&#39;s working directory; 
+translate them to your worktree root.
+</code></pre>
+<hr>
+<h2>5. OC 对比：Interface Dispatch vs 内联管道</h2>
+<p>OpenClaw 在子代理这个维度上，最显著的工程差异体现在<strong>上下文隔离的方式</strong>和<strong>Agent 定义的扩展方式</strong>：</p>
+<h3>5.1 Agent 定义：YAML Frontmatter vs TypeScript 定义</h3>
+<p><strong>CC（TypeScript 定义，编译时固化）</strong>：</p>
+<pre><code class="language-typescript">export const EXPLORE_AGENT: BuiltInAgentDefinition = {
+  agentType: &#39;Explore&#39;,
+  disallowedTools: [AGENT_TOOL_NAME, FILE_EDIT_TOOL_NAME, ...],
+  model: process.env.USER_TYPE === &#39;ant&#39; ? &#39;inherit&#39; : &#39;haiku&#39;,
+  omitClaudeMd: true,
+  getSystemPrompt: () =&gt; getExploreSystemPrompt(),
+}
+</code></pre>
+<p>内置 Agent 的能力边界在编译时就固化了，用户无法在运行时修改。</p>
+<p><strong>OC（Markdown + YAML Frontmatter，运行时加载）</strong>：</p>
+<pre><code class="language-yaml">---
+agentType: my-reviewer
+model: sonnet
+tools: [Read, Grep, Glob]
+permissionMode: readonly
+disallowedTools: [Bash, FileWrite]
+mcpServers:
+  - github-mcp
+hooks:
+  SubagentStart: check-context.sh
+---
+You are a code reviewer specializing in security vulnerabilities...
+</code></pre>
+<p>OC 的 Agent 是文件，放在 <code>.agents/</code> 目录下，运行时扫描和加载。用户可以添加自己的 Agent、修改内置 Agent、通过 Plugin 分发 Agent。这是一个<strong>开放的 Agent Registry</strong>，CC 的相应机制是封闭的。</p>
+<h3>5.2 Coordinator vs 无中心化</h3>
+<p>CC 的 Coordinator 模式有一个明确的中心节点：一个专门的 Coordinator 实例，只负责编排，不干活。这种架构在大型任务上有明显优势——Coordinator 的上下文不会被实现细节污染，始终保持对全局状态的清晰把握。</p>
+<p>OC 的多 Agent 场景更多是<strong>去中心化的对等协作</strong>：多个 Agent 可以通过 Task 系统相互派发任务，没有固定的&quot;谁是 Boss&quot;。这在灵活性上更强，但在任务依赖追踪和失败恢复上更复杂。</p>
+<h3>5.3 消息传递：task-notification vs 直接 tool_result</h3>
+<p>CC Coordinator 模式下，Worker 的结果通过 <code>&lt;task-notification&gt;</code> XML 以 <strong>user 消息</strong>的形式注入 Coordinator 的对话历史。这意味着：</p>
+<ul>
+<li>Coordinator 可以在多个 Worker 同时运行时，按完成顺序处理结果</li>
+<li>等待中的结果不阻塞其他工作</li>
+<li>Coordinator 的对话历史里是&quot;用户在告知我 Worker 完成了&quot;，而不是&quot;工具执行完返回了结果&quot;</li>
+</ul>
+<p>OC 更接近传统的同步 tool_result 模型：当 OC 调用子代理时，主循环等待子代理完成，结果作为 tool_result 返回。这在简单场景下更直观，但失去了 Coordinator 那种异步感知多个并行任务的能力。</p>
+<pre><code class="language-mermaid">graph LR
+    subgraph &quot;CC Coordinator 模型&quot;
+        C[&quot;Coordinator&quot;]
+        W1c[&quot;Worker A&quot;]
+        W2c[&quot;Worker B&quot;]
+        C --&gt;|&quot;异步派发&quot;| W1c
+        C --&gt;|&quot;异步派发&quot;| W2c
+        W1c --&gt;|&quot;task-notification (user msg)&quot;| C
+        W2c --&gt;|&quot;task-notification (user msg)&quot;| C
+        C --&gt;|&quot;继续处理，不阻塞&quot;| C
+    end
+    
+    subgraph &quot;OC 同步模型&quot;
+        M[&quot;主 Agent&quot;]
+        S1[&quot;子 Agent 1&quot;]
+        S2[&quot;子 Agent 2&quot;]
+        M --&gt;|&quot;同步等待&quot;| S1
+        S1 --&gt;|&quot;tool_result&quot;| M
+        M --&gt;|&quot;串行执行&quot;| S2
+    end
+</code></pre>
+<hr>
+<h2>6. 生命周期：同步 vs 异步</h2>
+<p>一个子代理究竟运行在父代理的时间线上，还是独立于父代理之外？这个问题决定了用户体验的根本差异。</p>
+<p><strong>同步路径</strong>（传统方式，<code>isAsync: false</code>）：</p>
+<ul>
+<li>父代理的主循环进入阻塞等待</li>
+<li>子代理完成后，结果作为 <code>tool_result</code> 返回</li>
+<li>父代理继续下一轮推理</li>
+<li>用户看到的是：一次工具调用，等待，返回结果</li>
+</ul>
+<p><strong>异步路径</strong>（现代方式，<code>isAsync: true</code>）：</p>
+<pre><code class="language-typescript">// 父代理不等待，立即返回
+void runWithAgentContext(asyncAgentContext, () =&gt; runAsyncAgentLifecycle({...}))
+return {
+  status: &#39;async_launched&#39;,
+  agentId: agentBackgroundTask.agentId,
+  outputFile: getTaskOutputPath(...)
+}
+</code></pre>
+<ul>
+<li>子代理独立开一个 <code>AbortController</code>，脱离父代理生命周期</li>
+<li>用户按 ESC 取消主代理时，后台子代理不受影响</li>
+<li>子代理的 transcript 写入 <code>outputFile</code>，有结果时再通知</li>
+</ul>
+<p>关键阈值：<code>isForkSubagentEnabled()</code> 激活时，<strong>所有</strong> subagent 调用都被强制走异步路径（<code>forceAsync = true</code>）。还有 <code>getAutoBackgroundMs() = 120_000</code>：运行时间超过 2 分钟的子代理会被自动转入后台，即使原来是同步派发的。</p>
+<hr>
+<h2>核心洞察对比</h2>
+<table>
+<thead>
+<tr>
+<th>设计维度</th>
+<th>Claude Code</th>
+<th>OpenClaw</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>子代理定义方式</strong></td>
+<td>TypeScript 硬编码，编译时固化</td>
+<td>YAML Frontmatter，运行时加载</td>
+</tr>
+<tr>
+<td><strong>Context 共享策略</strong></td>
+<td>Fork 路径字节级继承 + Prompt Cache 共享</td>
+<td>每次调用独立系统提示，重新构建</td>
+</tr>
+<tr>
+<td><strong>多 Agent 协作</strong></td>
+<td>Coordinator 模式（中心化编排）+ Agent 团队（进程级）</td>
+<td>对等协作，Task 系统分发</td>
+</tr>
+<tr>
+<td><strong>结果传递</strong></td>
+<td>异步 <code>&lt;task-notification&gt;</code> user message 注入</td>
+<td>同步 <code>tool_result</code> 返回</td>
+</tr>
+<tr>
+<td><strong>文件系统隔离</strong></td>
+<td>Worktree 隔离（可选）</td>
+<td>无内置隔离（冲突需用户管理）</td>
+</tr>
+<tr>
+<td><strong>Token 成本意识</strong></td>
+<td>CLAUDE.md 剥离、git status 剥离、占位符缓存共享</td>
+<td>各子 Agent 独立 Context，无专项优化</td>
+</tr>
+<tr>
+<td><strong>扩展性</strong></td>
+<td>封闭内置 Agent 库（Plugin 可扩展）</td>
+<td>开放 Agent Registry（.agents/ 目录）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>源码定位</h2>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>文件</th>
+<th>关键行</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Fork Agent 定义与递归防护</td>
+<td><code>AgentTool/forkSubagent.ts</code></td>
+<td>L32, L78, L107, L171</td>
+</tr>
+<tr>
+<td>Fork vs 显性 subagent 路由分支</td>
+<td><code>AgentTool/AgentTool.tsx</code></td>
+<td>L318-L356, L483-L541</td>
+</tr>
+<tr>
+<td>Coordinator 模式系统提示</td>
+<td><code>coordinator/coordinatorMode.ts</code></td>
+<td>L111-L368</td>
+</tr>
+<tr>
+<td>CLAUDE.md / gitStatus 裁剪</td>
+<td><code>AgentTool/runAgent.ts</code></td>
+<td>L385-L410</td>
+</tr>
+<tr>
+<td>同步/异步生命周期分叉</td>
+<td><code>AgentTool/AgentTool.tsx</code></td>
+<td>L686-L800</td>
+</tr>
+<tr>
+<td>Agent 团队邮箱通信</td>
+<td><code>utils/swarm/inProcessRunner.ts</code></td>
+<td>L689-L800</td>
+</tr>
+<tr>
+<td>Explore Agent 定义</td>
+<td><code>AgentTool/built-in/exploreAgent.ts</code></td>
+<td>全文</td>
+</tr>
+<tr>
+<td>Verification Agent 系统提示</td>
+<td><code>AgentTool/built-in/verificationAgent.ts</code></td>
+<td>L10-L129</td>
+</tr>
+<tr>
+<td>Worktree 隔离创建</td>
+<td><code>AgentTool/AgentTool.tsx</code></td>
+<td>L590-L593</td>
+</tr>
+</tbody></table>
+
+      </div>
+    </main>
+  </div>
+  
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      // Convert marked's code blocks to mermaid divs
+      const codeBlocks = document.querySelectorAll('code.language-mermaid');
+      codeBlocks.forEach(block => {
+        const pre = block.parentElement;
+        const div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = block.textContent;
+        pre.parentNode.replaceChild(div, pre);
+      });
+      // Handle blockquotes starting with [!IMPORTANT] etc.
+      const blockquotes = document.querySelectorAll('blockquote');
+      blockquotes.forEach(bq => {
+        const match = bq.innerHTML.match(/\[\!(.*)\]/);
+        if (match) {
+          bq.innerHTML = bq.innerHTML.replace(/\[\!(.*)\]/, '<strong>$1</strong><br/>');
+          bq.classList.add('insight-card');
+        }
+      });
+      
+      mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+    });
+  </script>
+</body>
+</html>

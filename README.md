@@ -2,6 +2,12 @@
 
 > **Claude Code Source** v2.1.88 源码泄露存档合集 -- 整合自三个不同来源，涵盖从原始破解还原到可直接运行的完整版本。**Claude Code** 源码、**v2.1.88** 下载、**Claude Code** 破解版、**Claude Code** 完整源码。
 
+## 源码导读主页
+
+- 项目主页站点入口位于 `docs/`
+- 主页目标不是罗列文件，而是用交互式方式串起 `loop / context / cache / subagent / memory`
+- 如果要接 GitHub Pages，直接把 Pages 目录指向 `/docs` 即可
+
 ---
 
 ## 目录导航

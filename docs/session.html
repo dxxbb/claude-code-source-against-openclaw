@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>01 Session：从用户到模型的映射链</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="docs-container">
+      <aside class="sidebar">
+        <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+        <nav>
+          <ul>
+            <li class="nav-item"><a href="index.html" class="nav-link">00 · 导引</a></li>
+            <li class="nav-item"><a href="index.html#core-loop" class="nav-link">01 · 主循环总图</a></li>
+            <li class="nav-item"><a href="session.html" class="nav-link active">01 · Session 边界</a></li>
+            <li class="nav-item"><a href="context.html" class="nav-link">02 · Context 组装</a></li>
+            <li class="nav-item"><a href="loop-engine.html" class="nav-link">03 · 回合引擎</a></li>
+            <li class="nav-item"><a href="subagent.html" class="nav-link">04 · 子代理/Fork</a></li>
+            <li class="nav-item"><a href="memory.html" class="nav-link">05 · 记忆与收尾</a></li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="main-content">
+        <div class="content-wrapper">
+          <header>
+            <h1>01 Session：从用户到模型的映射链</h1>
+            <p class="epigraph">
+              “用户觉得自己还在同一次对话里继续聊”这件事，到“模型本轮真正看到的 messages”之间，到底发生了多少次转换？
+            </p>
+          </header>
+
+          <section id="panorama">
+            <h2>概念全景图</h2>
+            <p>Session 系统涵盖了从多 Agent 路由、会话桶到历史持久化的全流程。下图展示了单条消息进入系统的演进路径：</p>
+            
+            <div class="mermaid-box">
+              <pre class="mermaid">
+graph TB
+    User["👤 用户"] --> Entry{{"入口形态"}}
+    Entry -->|"CLI"| CC_Session["CC Session"]
+    Entry -->|"IM (Slack/Lark)"| IMRoute["IM 路由层"]
+    IMRoute --> SK["sessionKey (会话桶)"]
+    SK --> Fresh{{"Freshness 判断"}}
+    Fresh -->|"Valid"| OC_Session["OC Session"]
+    CC_Session --> SessionId["sessionId (运行时实例)"]
+    OC_Session --> SessionId
+    SessionId --> Transcript["Transcript (磁盘记录)"]
+    Transcript -->|"Compact/Memory"| Messages["messagesForQuery (模型输入)"]
+    style Messages fill:#f8f9fa,stroke:#1a3a5f,stroke-width:2px
+              </pre>
+            </div>
+
+            <div class="key-insight">
+              归根结底，<strong>Session 的核心不是文件，而是映射链</strong>。链条越长，系统支持的接入场景通常越复杂（如跨平台支持）。
+            </div>
+          </section>
+
+          <section id="chains">
+            <h2>映射链深度对比</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>维度</th>
+                  <th>Claude Code (CC)</th>
+                  <th>OpenClaw (OC)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>入口身份</strong></td>
+                  <td>本地进程 (CWD)</td>
+                  <td>IM Account/Peer/Thread</td>
+                </tr>
+                <tr>
+                  <td><strong>路由机制</strong></td>
+                  <td>无 (直接对应)</td>
+                  <td>8 级优先级匹配 (<code>resolve-route.ts</code>)</td>
+                </tr>
+                <tr>
+                  <td><strong>重置策略</strong></td>
+                  <td>用户手动 (<code>/clear</code>)</td>
+                  <td>自动 (Daily/Idle 策略)</td>
+                </tr>
+                <tr>
+                  <td><strong>持久化形态</strong></td>
+                  <td>线性 JSONL (<code>.jsonl</code>)</td>
+                  <td>Transcript Tree (Pi SDK)</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section id="layers">
+            <h2>核心技术层次</h2>
+            
+            <h3>L2: IM 路由逻辑</h3>
+            <p>在 OC 中，同一个实例可以同时在多个群组扮演不同 Agent。这是通过 8 级路由实现的：</p>
+            <pre><code class="code-title">openclaw/src/routing/resolve-route.ts</code>
+const route = resolveAgentRoute({
+  channel,   // 飞书 / Slack / Telegram
+  accountId, // 机器人账号
+  peer,      // 对话者 (人/群)
+})</pre>
+
+            <h3>L4: 时间新鲜度 (Freshness)</h3>
+            <p>OC 默认在凌晨 4 点重置会话，以模拟人类对“新的一天”的直觉感受：</p>
+            <pre><code class="code-title">openclaw/src/config/sessions/reset.ts</code>
+const staleDaily = dailyResetAt != null && params.updatedAt < dailyResetAt;
+const staleIdle = idleExpiresAt != null && params.now > idleExpiresAt;</pre>
+
+            <h3>L7: 模型可见性 (Visibility)</h3>
+            <p>这是映射链的终点。所有的磁盘历史最终必须通过 Compact 算法转化为模型可接受的消息列表。</p>
+            <div class="key-insight">
+              CC 与 OC 的分歧点：CC 倾向于修改全局消息数组，而 OC 侧重于通过系统提示与 Bootstrap 上下文进行注入。
+            </div>
+          </section>
+
+          <section id="sources">
+            <h2>关键源码定位</h2>
+            <ul>
+              <li><strong>CC Session 切换</strong>: <code>bootstrap/state.ts#L435</code> - <code>regenerateSessionId()</code></li>
+              <li><strong>OC 路由起点</strong>: <code>routing/resolve-route.ts#L631</code> - <code>resolveAgentRoute()</code></li>
+              <li><strong>Pi 树级历史回溯</strong>: <code>session-manager.ts#L310</code> - <code>buildSessionContext()</code></li>
+            </ul>
+          </section>
+
+          <footer>
+            <p>01 Session Chapter · Claude Code vs OpenClaw Architecture Guide</p>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+  </body>
+</html>

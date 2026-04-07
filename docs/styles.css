@@ -1,0 +1,297 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Lora:ital,wght@0,500;0,600;0,700;1,500&family=Noto+Sans+SC:wght@400;500&family=Noto+Serif+SC:wght@500;700;900&family=Fira+Code:wght@400;500&display=swap');
+
+:root {
+  /* Colors - Modern Academic Light Theme */
+  --bg-color: #fafaf9; /* Pearl white/off-white */
+  --bg-surface: #ffffff;
+  --bg-sidebar: #f4f5f4;
+  --bg-code: #f3f4f6;
+  
+  --text-main: #334155; /* Soft charcoal for readability */
+  --text-heading: #1e293b;
+  --text-muted: #64748b;
+  
+  /* Accents */
+  --accent-primary: #3b82f6; /* Modern Blue */
+  --accent-hover: #2563eb;
+  --accent-secondary: #0f766e; /* Academic Teal */
+  
+  --border-color: rgba(15, 23, 42, 0.08);
+  --border-strong: rgba(15, 23, 42, 0.15);
+  
+  /* Shadows - Soft, modern diffusion */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.03);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.04), 0 2px 4px rgba(0,0,0,0.02);
+  --shadow-lg: 0 12px 32px rgba(0,0,0,0.05), 0 4px 12px rgba(0,0,0,0.02);
+  
+  /* Typography */
+  --font-serif: 'Lora', 'Noto Serif SC', serif;
+  --font-sans: 'Inter', 'Noto Sans SC', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Fira Code', ui-monospace, SFMono-Regular, monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  line-height: 1.8;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ----------------- Layout ----------------- */
+
+.docs-container {
+  display: flex;
+  min-height: 100vh;
+}
+
+.sidebar {
+  width: 280px;
+  background-color: var(--bg-sidebar);
+  border-right: 1px solid var(--border-color);
+  padding: 32px 24px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.sidebar-brand {
+  display: block;
+  font-family: var(--font-serif);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-heading);
+  text-decoration: none;
+  margin-bottom: 40px;
+  letter-spacing: -0.01em;
+}
+
+.sidebar nav ul {
+  list-style: none;
+}
+
+.nav-item {
+  margin-bottom: 8px;
+}
+
+.nav-link {
+  display: block;
+  padding: 8px 12px;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-radius: 8px;
+  font-weight: 500;
+  font-size: 14.5px;
+  transition: all 0.2s ease;
+}
+
+.nav-link:hover {
+  background-color: rgba(15, 23, 42, 0.04);
+  color: var(--text-heading);
+}
+
+.nav-link.active {
+  background-color: white;
+  color: var(--accent-primary);
+  box-shadow: var(--shadow-sm);
+  font-weight: 600;
+}
+
+.main-content {
+  flex-grow: 1;
+  padding: 64px 48px;
+  display: flex;
+  justify-content: center;
+}
+
+.content-wrapper {
+  max-width: 800px;
+  width: 100%;
+}
+
+/* ----------------- Markdown Content Styles ----------------- */
+
+.markdown-body {
+  font-family: var(--font-sans);
+  color: var(--text-main);
+}
+
+.markdown-body h1 {
+  font-family: var(--font-serif);
+  font-size: 2.5rem;
+  font-weight: 900;
+  color: var(--text-heading);
+  margin-bottom: 1.5rem;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
+.markdown-body h2 {
+  font-family: var(--font-serif);
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: var(--text-heading);
+  margin-top: 3.5rem;
+  margin-bottom: 1.25rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border-color);
+  line-height: 1.3;
+}
+
+.markdown-body h3 {
+  font-family: var(--font-sans);
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text-heading);
+  margin-top: 2.5rem;
+  margin-bottom: 1rem;
+}
+
+.markdown-body p {
+  margin-bottom: 1.5rem;
+}
+
+.markdown-body strong {
+  color: var(--text-heading);
+  font-weight: 600;
+}
+
+.markdown-body ul, .markdown-body ol {
+  margin-bottom: 1.5rem;
+  padding-left: 1.75rem;
+}
+
+.markdown-body li {
+  margin-bottom: 0.5rem;
+}
+
+/* Beautiful Blockquotes */
+.markdown-body blockquote {
+  margin: 2rem 0;
+  padding: 1.25rem 1.75rem;
+  background-color: var(--bg-sidebar);
+  border-left: 4px solid var(--accent-primary);
+  border-radius: 0 8px 8px 0;
+  font-family: var(--font-serif);
+  font-size: 1.1rem;
+  color: var(--text-heading);
+  font-style: italic;
+}
+
+.markdown-body blockquote > p:last-child {
+  margin-bottom: 0;
+}
+
+/* Tables (Academic Style) */
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 2rem 0;
+  font-size: 0.9rem;
+  background: var(--bg-surface);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--border-color);
+}
+
+.markdown-body th {
+  background-color: var(--bg-sidebar);
+  color: var(--text-heading);
+  font-weight: 600;
+  text-align: left;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.markdown-body td {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-color);
+  vertical-align: top;
+}
+
+.markdown-body tr:last-child td {
+  border-bottom: none;
+}
+
+/* Code Blocks */
+.markdown-body pre {
+  background-color: var(--bg-code);
+  padding: 1.5rem;
+  border-radius: 12px;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+  border: 1px solid var(--border-color);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.markdown-body code {
+  font-family: var(--font-mono);
+}
+
+.markdown-body p code, 
+.markdown-body li code,
+.markdown-body td code {
+  background-color: var(--bg-code);
+  color: #c2410c; /* Subdued vibrant orange for inline code */
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+  font-size: 0.85em;
+  border: 1px solid rgba(0,0,0,0.04);
+}
+
+/* Mermaid Wrapper */
+.mermaid {
+  display: flex;
+  justify-content: center;
+  background-color: white;
+  padding: 2rem;
+  border-radius: 16px;
+  box-shadow: var(--shadow-md);
+  margin: 2.5rem 0;
+  border: 1px solid var(--border-color);
+  overflow-x: auto;
+}
+
+/* Cards & Callouts - Friendly modern */
+.insight-card {
+  background-color: #f0fdf4; /* very light green */
+  border: 1px solid #bbf7d0;
+  padding: 1.5rem;
+  border-radius: 12px;
+  margin: 2rem 0;
+  color: #166534;
+}
+
+.insight-card strong {
+  color: #14532d;
+}
+
+/* Responsive */
+@media (max-width: 1024px) {
+  .docs-container {
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: relative;
+    padding: 24px;
+    border-right: none;
+    border-bottom: 1px solid var(--border-color);
+  }
+  .main-content {
+    padding: 32px 24px;
+  }
+}

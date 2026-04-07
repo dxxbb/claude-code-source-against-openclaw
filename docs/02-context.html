@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>02-Context</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="docs-container">
+    
+    <aside class="sidebar">
+      <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+      <nav>
+        <ul>
+          <li class="nav-item">
+            <a href="index.html" class="nav-link ">00 · 导言</a>
+          </li>
+            <li class="nav-item"><a href="01-session.html" class="nav-link ">01 · Session</a></li>
+          <li class="nav-item"><a href="02-context.html" class="nav-link active">02 · Context</a></li>
+          <li class="nav-item"><a href="03-loop-engine.html" class="nav-link ">03 · Loop Engine</a></li>
+          <li class="nav-item"><a href="04-subagent.html" class="nav-link ">04 · Subagent</a></li>
+          <li class="nav-item"><a href="05-memory.html" class="nav-link ">05 · Memory</a></li>
+
+        </ul>
+      </nav>
+    </aside>
+  
+    <main class="main-content">
+      <div class="content-wrapper markdown-body">
+        <h1>Context：送进模型的那一包数据，到底是怎么准备出来的？</h1>
+<h2>核心问题</h2>
+<blockquote>
+<p><strong>每次 API 调用之前，引擎从磁盘上的历史记录到最终送进模型的 messages 数组，中间经历了多少层处理？每一层的存在是为了解决什么问题？</strong></p>
+</blockquote>
+<p>这个问题的答案直接揭示了一个 Agent 系统最核心的&quot;生命保障系统&quot;。Claude Code 和 OpenClaw 在这里给出了截然不同的答案——一个选择将所有逻辑编码在一个精确对齐的数组组装管道里，另一个选择将这个管道本身变成一个可替换的组件。</p>
+<pre><code class="language-mermaid">graph TB
+    subgraph &quot;核心问题&quot;
+        T[&quot;💾 Transcript（磁盘上的历史记录）&quot;]
+        M[&quot;📦 Model Input（送进 API 的 messages）&quot;]
+        T -..-&gt; |&quot;中间发生了什么？&quot;| M
+    end
+</code></pre>
+<hr>
+<h2>Context 窗口的物理布局</h2>
+<p>在讨论&quot;怎么准备&quot;之前，先明确&quot;准备的是什么&quot;——Context 窗口里具体有哪些 Section，它们的顺序和性质是什么。</p>
+<h3>Claude Code：严格分区的线性 Section 数组</h3>
+<p>CC 的 Context 由两个部分组成：<code>system</code>（系统提示数组）和 <code>messages</code>（对话消息列表）。</p>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                    SYSTEM PROMPT（系统提示数组）                   │
+│                                                                 │
+│  ◆ 静态区 (cacheScope: &#39;global&#39;)  ← 跨 org 共享缓存              │
+│  ├── # Intro（角色定义 + 网络安全指令）                             │
+│  ├── # System（输出格式规则 / Hook 提示 / 无限上下文说明）           │
+│  ├── # Doing tasks（编码规范 / 任务执行规范）                       │
+│  ├── # Executing actions with care（危险操作确认规则）              │
+│  ├── # Using your tools（工具调用优先级 / 并发策略）                 │
+│  ├── # Tone and style（输出风格约束）                              │
+│  └── # Output efficiency（简洁性要求）                            │
+│                                                                 │
+│  ════════ __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ ════════           │
+│                                                                 │
+│  ◆ 动态区 (cacheScope: null)     ← 不缓存，每轮重新生成            │
+│  ├── # Session-specific guidance（按工具集动态生成的行为指引）       │
+│  ├── # Memory（用户 CLAUDE.md 的全文注入）                         │
+│  ├── # Environment（CWD / 时间戳 / OS / 模型名）                  │
+│  ├── # Language（用户语言偏好）                                    │
+│  ├── # Output style（如有自定义输出模板）                           │
+│  ├── # MCP Server Instructions（已连接 MCP 服务器的文档）           │
+│  ├── # Scratchpad instructions（思考过程格式约束）                  │
+│  └── … 其他 Feature Flag 控制的可选 Section                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    MESSAGES（对话消息列表）                         │
+│                                                                 │
+│  User（system-reminder）                                        │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ &lt;system-reminder&gt; gitStatus / claudeMd / 其他上下文 &lt;/…&gt;  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  …重复 N 轮…                                                    │
+│  ┌──────────────────┐  ┌────────────────────────────────────┐  │
+│  │ User message     │  │ Assistant message                  │  │
+│  │ &quot;帮我重构这个函数&quot; │  │ &lt;think&gt;…&lt;/think&gt;                   │  │
+│  └──────────────────┘  │ 好的，我先读一下文件                │  │
+│                         │ tool_use: Read(&quot;src/foo.ts&quot;)       │  │
+│                         └────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ User message (tool_result)                               │  │
+│  │ content: [{ type: &#39;tool_result&#39;, content: &#39;…文件内容…&#39; }] │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Assistant message                                          │ │
+│  │ &quot;根据文件内容，建议将 foo() 分解为…&quot;                           │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│  [如果发生 AutoCompact：以上历史被替换为一条摘要 User message]       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>几个关键观察：</strong></p>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th align="center">是否每轮变化</th>
+<th align="center">大小量级</th>
+<th align="center">缓存策略</th>
+</tr>
+</thead>
+<tbody><tr>
+<td># Doing tasks + 工具 Schema</td>
+<td align="center">否（Session 级稳定）</td>
+<td align="center">50-80KB</td>
+<td align="center"><code>global</code> cache</td>
+</tr>
+<tr>
+<td># Memory（CLAUDE.md）</td>
+<td align="center">有时（文件改动时）</td>
+<td align="center">变动大</td>
+<td align="center">不缓存</td>
+</tr>
+<tr>
+<td># Environment（CWD/时间）</td>
+<td align="center">是（时间戳每轮变）</td>
+<td align="center">&lt; 1KB</td>
+<td align="center">不缓存</td>
+</tr>
+<tr>
+<td>system-reminder 里的 gitStatus</td>
+<td align="center">是（git 状态随时变）</td>
+<td align="center">几 KB</td>
+<td align="center">不缓存</td>
+</tr>
+<tr>
+<td>Messages 历史</td>
+<td align="center">是（每轮追加）</td>
+<td align="center">累积增长</td>
+<td align="center">由压缩机制管控</td>
+</tr>
+</tbody></table>
+<hr>
+<h3>OpenClaw：扁平化 + 可注入的 Section 结构</h3>
+<p>OC 的系统提示是一个字符串（不是数组），由 <code>buildAgentSystemPrompt()</code> 一次性拼接，Section 顺序固定但内容依赖传入参数按需生成：</p>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                    SYSTEM PROMPT（单字符串）                       │
+│                                                                 │
+│  You are a personal assistant running inside OpenClaw.          │
+│                                                                 │
+│  ## Tooling（可用工具列表，按策略过滤后生成）                        │
+│  ## Tool Call Style（工具调用风格约束）                             │
+│  ## Safety（安全约束：无独立目标 / 人类监督优先）                    │
+│  ## OpenClaw CLI Quick Reference                                │
+│  ## Skills（如果配置了 Skills，在此注入 SKILL.md 摘要）            │
+│  ## Memory（memory-state 插件输出 / citation 模式控制）            │
+│  ## OpenClaw Self-Update（gateway 工具可用时）                    │
+│  ## Model Aliases（模型别名映射表）                                │
+│  ## Workspace（工作目录路径 + 安全操作指引）                        │
+│  ## Documentation（OC Docs 路径 + 外部链接）                      │
+│  ## Authorized Senders（owner 白名单，hash 或 raw）               │
+│  ## Current Date &amp; Time（用户时区）                               │
+│  ## Workspace Files (injected)（告知 Project Context 的入口）     │
+│  ## Messaging（消息路由 + message 工具指引）                       │
+│  ## Voice / TTS（语音提示，可选）                                  │
+│  ## Subagent Context / Group Chat Context                       │
+│    └── extraSystemPrompt（调用方注入，可携带 RAG 结果、角色设定）    │
+│  ## Silent Replies（空回复协议）                                   │
+│  ## Heartbeats（定时检查协议，可选）                                │
+│  ## Runtime（模型名 / OS / node / channel / 推理级别）             │
+│                                                                 │
+│  # Project Context（contextFiles 注入，每个 CLAUDE.md 等）        │
+│  ## path/to/CLAUDE.md                                           │
+│    [文件全文]                                                    │
+│  ## path/to/SOUL.md                                             │
+│    [文件全文]                                                    │
+│                                                                 │
+│  ┄ ContextEngine.assemble() 返回的 systemPromptAddition 追加 ┄   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    MESSAGES（由 Pi SDK 管理）                     │
+│  结构与 CC 类似（user/assistant 交替）                              │
+│  工具调用同样嵌入 assistant message 的 content 数组                 │
+│  关键差异：历史记录由 SessionManager + contextEngine.assemble()     │
+│            共同决定哪些轮次送进模型                                  │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>CC vs OC Section 结构的核心差异：</strong></p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Claude Code</th>
+<th>OpenClaw</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>系统提示形态</td>
+<td><code>string[]</code> 数组，每个元素一个 Section</td>
+<td>单个 <code>string</code>，全部拼接</td>
+</tr>
+<tr>
+<td>缓存分区</td>
+<td>Boundary 标记分为 static/dynamic 两组</td>
+<td>无内置分区，统一由 Pi SDK 缓存策略决定</td>
+</tr>
+<tr>
+<td>工具 Schema</td>
+<td>完整 JSON Schema 嵌入系统提示静态区</td>
+<td>工具摘要（2-10 词描述）嵌入系统提示，完整 Schema 在 Pi SDK 层传递</td>
+</tr>
+<tr>
+<td>项目文档注入</td>
+<td><code># Memory</code>（只含 CLAUDE.md / <code>.claude/</code> 目录）</td>
+<td><code># Project Context</code>（任意 contextFiles，包括 SOUL.md 等）</td>
+</tr>
+<tr>
+<td>动态追加</td>
+<td><code>resolvedDynamicSections</code> 在 Boundary 后追加</td>
+<td><code>contextEngine.assemble()</code> 返回的 <code>systemPromptAddition</code> 拼接到末尾</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>概念全景图：Context 的完整地图</h2>
+<p>在深入每一层之前，先看一张完整的概念地图：从原始历史记录到最终 API 请求，在这段距离里，哪些因素会干预数据，它们各自在什么位置？</p>
+<pre><code class="language-mermaid">graph TB
+    %% 原始历史
+    Disk[&quot;💾 sessionId.jsonl / SessionManager&quot;]
+
+    %% 两条主路径
+    Disk --&gt; CC_Path[&quot;Claude Code 路径&quot;]
+    Disk --&gt; OC_Path[&quot;OpenClaw 路径&quot;]
+
+    %% CC 路径
+    subgraph CC_Path[&quot;Claude Code：内联管道&quot;]
+        direction TB
+        CC1[&quot;getMessagesAfterCompactBoundary()&lt;br/&gt;（过滤掉已压缩部分）&quot;]
+        CC2[&quot;applyToolResultBudget()&lt;br/&gt;（单条截断：防止单个工具输出撑爆）&quot;]
+        CC3[&quot;snipCompactIfNeeded()&lt;br/&gt;（水位截断：按 Token 水位斩断历史中段）&quot;]
+        CC4[&quot;microcompactMessages()&lt;br/&gt;（外科手术：替换旧工具日志为 Tombstone）&quot;]
+        CC5[&quot;autocompact()&lt;br/&gt;（摘要化：唤醒 LLM 做完整的历史摘要）&quot;]
+        CC6[&quot;buildSystemPromptBlocks()&lt;br/&gt;（系统提示分割：static/dynamic 双缓存区）&quot;]
+        CC1 --&gt; CC2 --&gt; CC3 --&gt; CC4 --&gt; CC5 --&gt; CC6
+    end
+
+    %% OC 路径
+    subgraph OC_Path[&quot;OpenClaw 路径：引擎接口&quot;]
+        direction TB
+        OC1[&quot;resolveContextEngine()&lt;br/&gt;（从 registry 取出已注册的引擎实现）&quot;]
+        OC2[&quot;contextEngine.assemble()&lt;br/&gt;（引擎负责决定消息如何裁剪与格式化）&quot;]
+        OC3[&quot;contextEngine.compact()&lt;br/&gt;（引擎负责决定何时、如何压缩）&quot;]
+        OC4[&quot;contextEngine.afterTurn()&lt;br/&gt;（引擎负责落盘与后续维护）&quot;]
+        OC1 --&gt; OC2 --&gt; OC3 --&gt; OC4
+    end
+
+    %% 汇聚点
+    CC6 --&gt; API[&quot;🤖 API 请求&lt;br/&gt;system + messages&quot;]
+    OC4 --&gt; API
+
+    %% 样式
+    style API fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+</code></pre>
+<p><strong>怎么读这张图：</strong></p>
+<ul>
+<li><strong>CC 是直线管道</strong>：每一步都是函数调用，顺序固定，每个函数直接操作 <code>Message[]</code> 数组。</li>
+<li><strong>OC 是接口调度</strong>：<code>resolveContextEngine()</code> 先从注册表里取出引擎，后续所有操作通过接口调用转发给引擎实现。</li>
+<li><strong>两条路都汇入同一个终点</strong>：一个 <code>system prompt array</code> + 一个 <code>messages array</code>，格式化为 API 请求。</li>
+</ul>
+<hr>
+<h2>设计解读：每一层解决什么问题</h2>
+<h3>第 1 层：系统提示的&quot;静/动&quot;两分——Cache 经济学</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：大模型 API 的系统提示往往极为庞大（包含所有工具 Schema + 使用指南），如果每轮都把整段文本送出去让服务端重新处理，API 成本将极其昂贵。</p>
+</blockquote>
+<p><strong>Claude Code 的解法</strong>：用一个字面量标记 <code>SYSTEM_PROMPT_DYNAMIC_BOUNDARY = &#39;__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__&#39;</code> 把系统提示数组一分为二。</p>
+<pre><code class="language-typescript">// claude-code/src/constants/prompts.ts#L114
+// WARNING: Do not remove or reorder this marker without updating cache logic in:
+// - src/utils/api.ts (splitSysPromptPrefix)
+// - src/services/api/claude.ts (buildSystemPromptBlocks)
+export const SYSTEM_PROMPT_DYNAMIC_BOUNDARY = &#39;__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__&#39;
+</code></pre>
+<p><code>splitSysPromptPrefix()</code> 在 API 调用前扫描系统提示数组，找到这个 Boundary 后：</p>
+<ul>
+<li><strong>Boundary 之前</strong>（<code>cacheScope: &#39;global&#39;</code>）：绝对不变的内容——<code># Doing tasks</code>（编码约束），全量工具 Schema（Bash、FileRead、Glob 等所有工具的 JSON 定义）。这一块标记为 <code>global</code> scope 的跨组织共享缓存。</li>
+<li><strong>Boundary 之后</strong>（<code>cacheScope: null</code>，不缓存）：<strong>每轮必变</strong>的内容——<code># Session-specific guidance</code>（根据当前工具集动态生成），<code># Memory</code>（当前 CLAUDE.md 注入），<code># Environment</code>（CWD、时间、OS 等），<code># Language</code>（用户偏好）。</li>
+</ul>
+<pre><code class="language-typescript">// claude-code/src/utils/api.ts#L380-L396
+// 只有边界前的块被标记为 global 缓存
+if (i &lt; boundaryIndex) {
+  staticBlocks.push(block)   // → cacheScope: &#39;global&#39;
+} else {
+  dynamicBlocks.push(block)  // → cacheScope: null（不缓存）
+}
+</code></pre>
+<blockquote>
+<p><strong>设计洞察</strong>：Anthropic 的 Prompt Cache 要求前缀必须<strong>字节完全一致</strong>才命中。哪怕是时区偏移导致的时间戳变化，或者工具权限变化导致的 Session Guidance 更新，都会让缓存全盘失效。Boundary 的本质是<strong>隔离区</strong>：把一切&quot;可能随时间或用户状态变化的东西&quot;驱逐出静态区，让静态区的巨大工具 Schema（通常超过 60KB）可以被永久缓存命中。</p>
+</blockquote>
+<p><strong>OpenClaw 的对应设计</strong>：系统提示的分区策略由 <code>buildEmbeddedSystemPrompt()</code> 在 <code>attempt.ts</code> 中完成，逻辑类似，但结果通过 <code>contextEngine.assemble()</code> 的返回结果中的 <code>systemPromptAddition</code> 字段注入——引擎可以在 assemble 阶段为本轮追加额外的系统提示片段。</p>
+<hr>
+<h3>第 2 层：工具日志的预算控制——防止单次爆炸</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：一次 <code>Read(large_file.ts)</code> 可能返回几万字节的内容。如果不拦截，单个工具调用就能把 Context Window 的大半消耗殆尽。</p>
+</blockquote>
+<p><strong>Claude Code</strong>：<code>applyToolResultBudget()</code> 在每轮推理前对 <code>messagesForQuery</code> 做<strong>消费量检查</strong>。每个工具有独立的 <code>maxResultSizeChars</code> 配置（设置了 <code>maxResultSizeChars</code> 的工具会被豁免，否则统一受全局 Budget 约束）。超限的工具结果被截断，并以 Tombstone 替换：<code>[Content truncated: X characters over budget]</code>。</p>
+<pre><code class="language-typescript">// claude-code/src/query.ts#L379-L394
+messagesForQuery = await applyToolResultBudget(
+  messagesForQuery,
+  toolUseContext.contentReplacementState,
+  persistReplacements ? records =&gt; void recordContentReplacement(...) : undefined,
+  new Set(toolUseContext.options.tools
+    .filter(t =&gt; !Number.isFinite(t.maxResultSizeChars))
+    .map(t =&gt; t.name)),
+)
+</code></pre>
+<blockquote>
+<p><strong>设计洞察</strong>：截断后的内容会被持久化写入 <code>contentReplacementState</code> 并记录到会话文件中（通过 <code>recordContentReplacement</code>）。这意味着当用户 <code>/resume</code> 恢复会话时，截断信息能够被还原，下一轮的 API 调用不会再重新计算截断范围。这是一个成本控制和 Resume 一致性之间精妙的双赢设计。</p>
+</blockquote>
+<p><strong>OpenClaw</strong>：Token 配额由 <code>contextEngine.assemble()</code> 的 <code>tokenBudget</code> 参数传入，引擎自行决定如何执行约束。不同的引擎实现可以有不同的截断策略——比如一个面向语音应用的引擎可以优先保留对话型消息，丢弃工具日志；而内置的 <code>LegacyContextEngine</code> 则直接放行（return <code>{ messages: params.messages }</code>），把配额控制的责任完全交给运行时的上游逻辑。</p>
+<hr>
+<h3>第 3 层：Snip——水位截断，保头保尾</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：当整体 Token 数触达 Context Window 的警戒水位，但 AutoCompact 还没有触发（或者被禁用了），需要一个临时的&quot;减压阀&quot;。</p>
+</blockquote>
+<p><strong>Claude Code</strong>：<code>snipCompactIfNeeded()</code> 是一个暴力手段——它扫描消息历史，把中段老旧的问答轮次直接切除，<strong>只保留最开头的系统消息片段和最近的若干轮对话</strong>，插入一个 Boundary 标记表示&quot;这里曾经有内容被删除&quot;。</p>
+<ul>
+<li>代价：<strong>中段对话永远丢失</strong>，模型看不到这些内容存在过</li>
+<li>目的：瞬间买回足够的 Token 空间，让当前这轮推理能够正常发起</li>
+</ul>
+<pre><code class="language-typescript">// claude-code/src/query.ts#L401-L410
+if (feature(&#39;HISTORY_SNIP&#39;)) {
+  const snipResult = snipModule!.snipCompactIfNeeded(messagesForQuery)
+  messagesForQuery = snipResult.messages
+  snipTokensFreed = snipResult.tokensFreed  // 传给 autocompact 作为减量参考
+}
+</code></pre>
+<blockquote>
+<p><strong>设计洞察</strong>：Snip 和 AutoCompact 不是互斥的，它们在同一轮循环中<strong>可以都触发</strong>——先 Snip 腾出空间，再 AutoCompact 把剩余内容整理成摘要。<code>snipTokensFreed</code> 被刻意传给了 autocompact 的触发阈值计算，防止这种情况：Snip 后 Token 数已经降到阈值以下，但 autocompact 用了 Snip 之前的旧统计值，以为还需要再压缩。</p>
+</blockquote>
+<hr>
+<h3>第 4 层：Microcompact（Tombstone 机制）——外科手术，不动骨架</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：工具日志是最大的 Token 消耗源，但对话骨架（推理结论、决策记录）是有价值的。能不能只清除日志，保留对话结构？</p>
+</blockquote>
+<p><strong>Claude Code</strong>：<code>microcompactMessages()</code> 不删消息，不改对话结构——它遍历历史，定位那些消耗大量 Token 的<strong>特定工具的结果</strong>（<code>COMPACTABLE_TOOLS = Set{FileRead, Bash, Grep, Glob, WebSearch, WebFetch, FileEdit, FileWrite}</code>），将其内容替换为字面量字符串 <code>&#39;[Old tool result content cleared]&#39;</code>，同时保留消息ID和位置不变。</p>
+<pre><code class="language-typescript">// claude-code/src/services/compact/microCompact.ts#L41-L50
+const COMPACTABLE_TOOLS = new Set&lt;string&gt;([
+  FILE_READ_TOOL_NAME,      // 文件读取
+  ...SHELL_TOOL_NAMES,      // Bash/Shell
+  GREP_TOOL_NAME,           // 文件搜索
+  GLOB_TOOL_NAME,           // 路径匹配
+  WEB_SEARCH_TOOL_NAME,     // 网页搜索
+  WEB_FETCH_TOOL_NAME,      // 网页抓取
+  FILE_EDIT_TOOL_NAME,      // 文件编辑
+  FILE_WRITE_TOOL_NAME,     // 文件写入
+])
+</code></pre>
+<p>更精妙的是 <strong>Cached Microcompact</strong>（限一方用户）：它不直接修改本地消息内容，而是向 API 发送额外的 <code>cache_edits</code> 指令，让服务端在<strong>不破坏 Prompt Cache 的前提下</strong>删除缓存中的旧工具内容。本地消息不变，下次请求发过去的 API 参数里带着&quot;删掉 toolId: abc 的缓存&quot;——这意味着 Tombstone 手术是在服务端执行的，本地历史保持干净。</p>
+<blockquote>
+<p><strong>设计洞察</strong>：常规 Microcompact 修改本地消息 → <strong>Prompt Cache 必然失效</strong>（内容变了）。Cached Microcompact 不改本地消息 → <strong>Prompt Cache 继续命中</strong>，只是告诉服务端&quot;那个工具的缓存内容你可以删了&quot;。代价是每次 API 请求都要携带 <code>cache_edits</code> 元信息，收益是避免了因 Tombstone 替换而触发的缓存重建费用。选择哪条路，取决于服务商是否支持 Cache Editing API。</p>
+</blockquote>
+<hr>
+<h3>第 5 层：AutoCompact——最终大招，全量摘要</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：前四层都是&quot;外科手术&quot;——精准截断、局部替换。但有时候历史实在太长，外科手术已无济于事，只能&quot;大脑换芯&quot;——让一个 LLM 把整段对话历史重写成一段精炼的摘要，用摘要替换所有历史消息。</p>
+</blockquote>
+<p><strong>Claude Code</strong>：<code>autocompact()</code> 在每轮推理前检查当前 token 数是否超过阈值（由 <code>calculateTokenWarningState()</code> 判定），如果超过，则：</p>
+<ol>
+<li>另起一个内部 LLM 调用（一般用轻量级 Haiku）</li>
+<li>对当前 <code>messagesForQuery</code> 进行归纳压缩</li>
+<li>生成的摘要文本作为新的消息历史第一条</li>
+<li>后续对话附加在摘要之后继续</li>
+</ol>
+<pre><code class="language-typescript">// claude-code/src/query.ts#L453-L467
+const { compactionResult, consecutiveFailures } = await deps.autocompact(
+  messagesForQuery,
+  toolUseContext,
+  { systemPrompt, userContext, systemContext, toolUseContext, forkContextMessages: messagesForQuery },
+  querySource,
+  tracking,
+  snipTokensFreed,   // ← Snip 腾出的空间已经算在里面
+)
+</code></pre>
+<p>失败有保护：<code>consecutiveFailures</code> 计数，多次连续失败后停止重试，交由外部触发的 <code>/compact</code> 命令接手。</p>
+<p><strong>OpenClaw</strong>：<code>contextEngine.compact()</code> 是对应接口。内置的 <code>LegacyContextEngine</code> 把实现委托给 <code>delegateCompactionToRuntime()</code>，最终路径和 CC 的 AutoCompact 逻辑一致。区别在于：OC 的引擎可以<strong>重载</strong> <code>compact()</code> 实现自己的压缩策略——比如&quot;保存最近 50 轮问答的完整记录，只压缩超出 50 轮的部分&quot;，而这种差异化策略在 CC 里是不可能不改核心代码就做到的。</p>
+<hr>
+<h3>第 6 层：Context Engine 注册机制——CC 和 OC 的架构分歧点</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：如果你想把 Context 管理的&quot;数据库&quot;从本地 JSON 文件换成 Redis、换成向量数据库（RAG），或者你想针对不同的模型用不同的消息格式（OpenAI 的消息格式和 Anthropic 的不同），CC 和 OC 的加法难度有多大？</p>
+</blockquote>
+<p><strong>Claude Code：无接口，直接操作数组</strong></p>
+<p>CC 的 Context 流转全部在 <code>query.ts</code> 的 <code>queryLoop()</code> 内，以<strong>函数调用串联</strong>的方式内嵌：</p>
+<pre><code class="language-typescript">// claude-code/src/query.ts#L365
+let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
+// 然后依次调用 applyToolResultBudget → snip → microcompact → autocompact
+</code></pre>
+<p>所有函数都直接引用 <code>Message[]</code> 类型——这是 Anthropic SDK 的原生消息类型。如果你想接入 OpenAI API，你需要把这个数组里的每一个 <code>ToolResultBlockParam</code> 格式换成 OpenAI 的格式，改动将蔓延至整个 query 和 compact 子系统。</p>
+<p><strong>OpenClaw：三层注册机制</strong></p>
+<p>OC 提取了 <code>ContextEngine</code> 接口（<code>src/context-engine/types.ts</code>），并通过 <code>registerContextEngineForOwner()</code> / <code>registerContextEngine()</code> 构建了一个<strong>进程全局注册表</strong>：</p>
+<pre><code class="language-typescript">// openclaw/src/context-engine/registry.ts#L345-L367
+export function registerContextEngineForOwner(
+  id: string,
+  factory: ContextEngineFactory,  // () =&gt; ContextEngine | Promise&lt;ContextEngine&gt;
+  owner: string,
+  opts?: { allowSameOwnerRefresh?: boolean }
+): ContextEngineRegistrationResult {
+  // ...
+  registry.set(id, { factory, owner: normalizedOwner })
+  return { ok: true }
+}
+</code></pre>
+<p>在运行时，<code>resolveContextEngine()</code> 读取 config 中的插槽配置（<code>config.plugins.slots.contextEngine</code>），从注册表找到对应的工厂函数，创建引擎实例：</p>
+<pre><code class="language-typescript">// openclaw/src/context-engine/registry.ts#L411-L427
+export async function resolveContextEngine(config?: OpenClawConfig): Promise&lt;ContextEngine&gt; {
+  const slotValue = config?.plugins?.slots?.contextEngine
+  const engineId = typeof slotValue === &#39;string&#39; &amp;&amp; slotValue.trim()
+    ? slotValue.trim()
+    : defaultSlotIdForKey(&#39;contextEngine&#39;)  // 默认值是 &quot;legacy&quot;
+
+  const entry = getContextEngineRegistryState().engines.get(engineId)
+  if (!entry) throw new Error(`Context engine &quot;${engineId}&quot; is not registered...`)
+  return wrapContextEngineWithSessionKeyCompat(await entry.factory())
+}
+</code></pre>
+<blockquote>
+<p><strong>设计洞察</strong>：OC 的注册表是<strong>进程全局单例</strong>（<code>Symbol.for(&quot;openclaw.contextEngineRegistryState&quot;)</code>）。这个设计刻意为之，是为了在同一个 Node.js 进程里多次 <code>require()</code> 相同模块时（npm 多版本场景），所有副本都共享同一个注册中心，防止引擎注册丢失。不同的引擎可以服务同一进程内的不同 Session，而 CC 的单函数管道在同一进程里只有一套逻辑。</p>
+</blockquote>
+<hr>
+<h2>两边怎么做：差异的根本原因</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Claude Code</th>
+<th>OpenClaw Agent Runtime</th>
+<th>差异原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Context 管道形态</td>
+<td>内联函数调用链（<code>query.ts</code> 直接串联）</td>
+<td>接口调度（<code>resolveContextEngine()</code> + 调用方法）</td>
+<td>CC 是单体 CLI，OC 是多租户网关</td>
+</tr>
+<tr>
+<td>工具日志清除</td>
+<td>Tombstone 替换 / Cached MC（Cache Editing）</td>
+<td>委托 <code>contextEngine.compact()</code> 实现</td>
+<td>CC 追求极致缓存命中率，OC 留出替换空间</td>
+</tr>
+<tr>
+<td>模型格式适配</td>
+<td>写死为 Anthropic SDK 格式（<code>Message[]</code>）</td>
+<td><code>assemble()</code> 可按 <code>model</code> 参数输出不同格式</td>
+<td>CC 只服务 Anthropic，OC 要服务多个提供商</td>
+</tr>
+<tr>
+<td>外部记忆接入</td>
+<td>无接口，需改 query.ts + compact 子系统</td>
+<td>实现 <code>ContextEngine</code>，在 <code>ingest</code>/<code>assemble</code> 拦截</td>
+<td>CC 没有企业级网关需求</td>
+</tr>
+<tr>
+<td>压缩策略定制</td>
+<td>固定：Budget→Snip→MC→AutoCompact</td>
+<td>引擎可完全重写 <code>compact()</code> 逻辑</td>
+<td>OC 支持第三方插件生态</td>
+</tr>
+<tr>
+<td>系统提示分区</td>
+<td>Boundary 字面量标记（<code>__SYSTEM..._BOUNDARY__</code>）</td>
+<td><code>systemPromptAddition</code> 字段在 <code>assemble</code> 结果注入</td>
+<td>相同的目标（缓存隔离），不同的实现形式</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>场景演练：同一个「读取了一个 10 万字节文件」的工具调用，下一轮推理前发生了什么？</h2>
+<p><strong>在 Claude Code 中</strong>：</p>
+<ol>
+<li><code>getMessagesAfterCompactBoundary()</code> → 过滤出当前对话分支的消息</li>
+<li><code>applyToolResultBudget()</code> → 检测到这个 FileRead 结果超过 <code>maxResultSizeChars</code> → <strong>截断</strong>，本地写入 <code>contentReplacementState</code></li>
+<li><code>snipCompactIfNeeded()</code> → Token 水位检查，如果仍正常，不触发</li>
+<li><code>microcompactMessages()</code> → 如果此前若干轮还有其他旧的 FileRead/Bash 结果 → 把它们的内容替换为 <code>&#39;[Old tool result content cleared]&#39;</code>（或通过 <code>cache_edits</code> 让服务端删除）</li>
+<li><code>autocompact()</code> → 如果 Token 总量仍然超过阈值 → 唤醒轻量级 LLM 做摘要</li>
+<li><code>buildSystemPromptBlocks()</code> → 按 Boundary 切割系统提示，静态区标记 <code>global</code> cache scope</li>
+</ol>
+<p><strong>在 OpenClaw 中</strong>：</p>
+<ol>
+<li><code>resolveContextEngine(config)</code> → 从注册表取出 <code>LegacyContextEngine</code>（或配置中指定的引擎）</li>
+<li><code>contextEngine.assemble({ messages, tokenBudget, model })</code> → 引擎按 tokenBudget 约束整理消息，<code>LegacyContextEngine</code> 直接透传（<code>pi-coding-agent</code> 层面的 SessionManager 在更上游已经做过处理）</li>
+<li>本轮 LLM 推理结束后，<code>contextEngine.afterTurn(...)</code> → 引擎自行决定是否触发 <code>compact()</code> 以及落盘方式</li>
+</ol>
+<p><strong>两边都到达了相同的终点</strong>：一个不超过 Context Window 的 <code>messages</code> 数组 + 一个分了缓存区的 <code>system prompt</code>，打包成 API 请求。</p>
+<hr>
+<h2>源码定位</h2>
+<h3>Claude Code</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>关键内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="../03-claude-code-runnable/src/constants/prompts.ts#L114">constants/prompts.ts#L114</a></td>
+<td><code>SYSTEM_PROMPT_DYNAMIC_BOUNDARY</code> 定义与注释</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/utils/api.ts#L321">utils/api.ts#L321</a></td>
+<td><code>splitSysPromptPrefix()</code> — 按 Boundary 切割并打 cache scope 标签</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L365">query.ts#L365</a></td>
+<td><code>messagesForQuery</code> 四步过滤管道的入口</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L379">query.ts#L379</a></td>
+<td><code>applyToolResultBudget()</code> — 单条工具结果截断</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L401">query.ts#L401</a></td>
+<td><code>snipCompactIfNeeded()</code> — 水位截断</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/services/compact/microCompact.ts#L41">services/compact/microCompact.ts#L41</a></td>
+<td><code>COMPACTABLE_TOOLS</code> — 哪些工具的结果会被 Tombstone</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/services/compact/microCompact.ts#L253">services/compact/microCompact.ts#L253</a></td>
+<td><code>microcompactMessages()</code> — Tombstone 机制主逻辑</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L453">query.ts#L453</a></td>
+<td><code>deps.autocompact()</code> — LLM 摘要压缩触发点</td>
+</tr>
+</tbody></table>
+<h3>OpenClaw</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>关键内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="../openclaw/src/context-engine/types.ts#L104">context-engine/types.ts#L104</a></td>
+<td><code>ContextEngine</code> 接口完整定义（bootstrap/ingest/assemble/compact/afterTurn）</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/context-engine/registry.ts#L345">context-engine/registry.ts#L345</a></td>
+<td><code>registerContextEngineForOwner()</code> — 引擎注册</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/context-engine/registry.ts#L411">context-engine/registry.ts#L411</a></td>
+<td><code>resolveContextEngine()</code> — 按插槽配置解析并返回引擎实例</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/context-engine/legacy.ts#L21">context-engine/legacy.ts#L21</a></td>
+<td><code>LegacyContextEngine</code> — 默认引擎，透传 assemble，compact 委托给运行时</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/agents/pi-embedded-runner/run/attempt.context-engine-helpers.ts#L53">pi-embedded-runner/run/attempt.context-engine-helpers.ts#L53</a></td>
+<td><code>assembleAttemptContextEngine()</code> — 每轮推理前调用引擎的 assemble</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/agents/pi-embedded-runner/run/attempt.context-engine-helpers.ts#L75">pi-embedded-runner/run/attempt.context-engine-helpers.ts#L75</a></td>
+<td><code>finalizeAttemptContextEngineTurn()</code> — 每轮结束后的 ingest + afterTurn + maintain</td>
+</tr>
+</tbody></table>
+
+      </div>
+    </main>
+  </div>
+  
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      // Convert marked's code blocks to mermaid divs
+      const codeBlocks = document.querySelectorAll('code.language-mermaid');
+      codeBlocks.forEach(block => {
+        const pre = block.parentElement;
+        const div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = block.textContent;
+        pre.parentNode.replaceChild(div, pre);
+      });
+      // Handle blockquotes starting with [!IMPORTANT] etc.
+      const blockquotes = document.querySelectorAll('blockquote');
+      blockquotes.forEach(bq => {
+        const match = bq.innerHTML.match(/\[\!(.*)\]/);
+        if (match) {
+          bq.innerHTML = bq.innerHTML.replace(/\[\!(.*)\]/, '<strong>$1</strong><br/>');
+          bq.classList.add('insight-card');
+        }
+      });
+      
+      mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+    });
+  </script>
+</body>
+</html>

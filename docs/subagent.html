@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>04 子代理与多 Agent：如何将自己「一分为多」</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="docs-container">
+      <aside class="sidebar">
+        <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+        <nav>
+          <ul>
+            <li class="nav-item"><a href="index.html" class="nav-link">00 · 导引</a></li>
+            <li class="nav-item"><a href="index.html#core-loop" class="nav-link">01 · 主循环总图</a></li>
+            <li class="nav-item"><a href="session.html" class="nav-link">01 · Session 边界</a></li>
+            <li class="nav-item"><a href="context.html" class="nav-link">02 · Context 组装</a></li>
+            <li class="nav-item"><a href="loop-engine.html" class="nav-link">03 · 回合引擎</a></li>
+            <li class="nav-item"><a href="subagent.html" class="nav-link active">04 · 子代理/Fork</a></li>
+            <li class="nav-item"><a href="memory.html" class="nav-link">05 · 记忆与收尾</a></li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="main-content">
+        <div class="content-wrapper">
+          <header>
+            <h1>04 子代理与多 Agent：协作体系</h1>
+            <p class="epigraph">
+              “当一个任务需要并行推进、需要保护主上下文不被淹没、或者需要独立视角来验证工作时，Agent 是如何从单一进程演变为协作体系的？”
+            </p>
+          </header>
+
+          <section id="philosophy">
+            <h2>两套截然不同的哲学</h2>
+            <div class="key-insight">
+              <strong>Claude Code:</strong> 一切皆子代理 (Subagent-centric)。通过 <code>AgentTool</code> 原语按需组装工具池与权限。<br>
+              <strong>OpenClaw:</strong> 协调员-工人模型 (Coordinator-Worker)。主实例负责拆解与汇总，Worker 负责执行，通过 XML 消息体系通信。
+            </div>
+          </section>
+
+          <section id="modes">
+            <h2>CC 的三种 Agent 创建模式</h2>
+            <p>在 Claude Code 中，调用 <code>AgentTool</code> 会根据参数进入三条不同的执行路径：</p>
+            
+            <div class="mermaid-box">
+              <pre class="mermaid">
+graph TD
+    A["调用 AgentTool"] --> B{subagent_type?}
+    B -- "省略" --> C["🍴 Fork 路径<br/>上下文继承"]
+    B -- "指定类型" --> D{name + team_name?}
+    D -- "是" --> E["👥 团队路径<br/>spawnTeammate()"]
+    D -- "否" --> F["🎯 功能子代理<br/>独立 System Prompt"]
+              </pre>
+            </div>
+
+            <table>
+              <thead>
+                <tr>
+                  <th>模式</th>
+                  <th>触发条件</th>
+                  <th>上下文来源</th>
+                  <th>中断控制</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Fork 子代理</strong></td>
+                  <td>子类省略</td>
+                  <td>继承父代理完整对话 + 占位符</td>
+                  <td>独立 (异步)</td>
+                </tr>
+                <tr>
+                  <td><strong>功能子代理</strong></td>
+                  <td>指定 Agent 类型</td>
+                  <td>独立系统提示 + 新 User 消息</td>
+                  <td>继承 (同步)</td>
+                </tr>
+                <tr>
+                  <td><strong>多代理团队</strong></td>
+                  <td>指定 Team 属性</td>
+                  <td>新进程启动，完全独立</td>
+                  <td>进程级隔离</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section id="fork">
+            <h2>Fork 机制：缓存优化的极致</h2>
+            <p><strong>为什么要 Fork？</strong> 如果为每个并行任务开新代理，厚重的工具定义（60KB+）会多次占用 API 缓存位。Fork 的目标是让多个子代理共享同一个 Prompt Cache 槽位。</p>
+            
+            <div class="key-insight">
+              <strong>字节级对齐：</strong> <code>buildForkedMessages</code> 会使用完全相同的 <code>FORK_PLACEHOLDER_RESULT</code> 填补工具结果位。只有消息末尾的具体指令不同，从而保证了 API 请求前缀的字节级一致性，极大提升了缓存命中率。
+            </div>
+          </section>
+
+          <section id="coordinator">
+            <h2>Coordinator 模式与 Worktree 隔离</h2>
+            <p>当开启 <code>COORDINATOR_MODE</code> 时，主代理不再亲自修改文件，而是作为“指挥官”：</p>
+            <ul>
+              <li><strong>AgentTool</strong>: 派发新 Worker。</li>
+              <li><strong>Task-Notification</strong>: Worker 完成后回传 XML 报告，主代理进行结果合成。</li>
+              <li><strong>Worktree 隔离</strong>: 为每个并发任务创建独立的 git worktree，从物理层面消除文件写冲突。</li>
+            </ul>
+          </section>
+
+          <section id="oc-compare">
+            <h2>OC 对比：YAML Registry vs TS 硬编码</h2>
+            <p>OpenClaw 在 Agent 定义上选择了更开放的架构：</p>
+            <table>
+              <thead>
+                <tr>
+                  <th>维度</th>
+                  <th>Claude Code</th>
+                  <th>OpenClaw</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>定义方式</strong></td>
+                  <td>TypeScript 编译时固化 (封闭)</td>
+                  <td>YAML Frontmatter 运行时加载 (开放)</td>
+                </tr>
+                <tr>
+                  <td><strong>结果传递</strong></td>
+                  <td>异步 <code>task-notification</code> 注入</td>
+                  <td>同步 <code>tool_result</code> 返回</td>
+                </tr>
+                <tr>
+                  <td><strong>文件隔离</strong></td>
+                  <td>Worktree 机制</td>
+                  <td>依靠开发者手动管理冲突</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section id="sources">
+            <h2>关键源码定位</h2>
+            <ul>
+              <li><strong>Fork 递归防护</strong>: <code>AgentTool/forkSubagent.ts</code></li>
+              <li><strong>Coordinator 提示词</strong>: <code>coordinator/coordinatorMode.ts#L111</code></li>
+              <li><strong>Worktree 创建</strong>: <code>AgentTool/AgentTool.tsx#L590</code></li>
+              <li><strong>OC 路由加载器</strong>: <code>agents/subagent-spawn.ts</code></li>
+            </ul>
+          </section>
+
+          <footer>
+            <p>04 Subagent Chapter · Claude Code vs OpenClaw Architecture Guide</p>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+  </body>
+</html>

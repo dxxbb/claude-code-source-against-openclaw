@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>03 Loop Engine：Agent 生命的每一次「心跳」</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="docs-container">
+      <aside class="sidebar">
+        <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+        <nav>
+          <ul>
+            <li class="nav-item"><a href="index.html" class="nav-link">00 · 导引</a></li>
+            <li class="nav-item"><a href="index.html#core-loop" class="nav-link">01 · 主循环总图</a></li>
+            <li class="nav-item"><a href="session.html" class="nav-link">01 · Session 边界</a></li>
+            <li class="nav-item"><a href="context.html" class="nav-link">02 · Context 组装</a></li>
+            <li class="nav-item"><a href="loop-engine.html" class="nav-link active">03 · 回合引擎</a></li>
+            <li class="nav-item"><a href="subagent.html" class="nav-link">04 · 子代理/Fork</a></li>
+            <li class="nav-item"><a href="memory.html" class="nav-link">05 · 记忆与收尾</a></li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="main-content">
+        <div class="content-wrapper">
+          <header>
+            <h1>03 Loop Engine：Agent 的动力源泉</h1>
+            <p class="epigraph">
+              “用户发了一条指令，模型在一轮响应里究竟调用了多少次 API，工具是怎么排队执行的，什么时候才算真的「结束」？”
+            </p>
+          </header>
+
+          <section id="skeleton">
+            <h2>一轮 while(true) 的剖析</h2>
+            <p>Loop Engine 是 Agent 的核心推进器，负责调度模型推理、实时解析工具调用流，并处理复杂的异常恢复。</p>
+            
+            <div class="mermaid-box">
+              <pre class="mermaid">
+stateDiagram-v2
+    [*] --> 上下文准备
+    上下文准备 --> 模型推理 : 投递 messagesForQuery
+    模型推理 --> 流式解析 : 边生成边识别
+    流式解析 --> 工具调度 : 检测到 tool_use
+    流式解析 --> 停止判定 : 无剩余 token / end_turn
+    工具调度 --> 结果回收 : 执行完毕
+    结果回收 --> 上下文准备 : 进入下一轮
+    停止判定 --> [*] : 完成任务
+              </pre>
+            </div>
+          </section>
+
+          <section id="streaming">
+            <h2>流式解析与工具触发时机</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>特性</th>
+                  <th>Claude Code (Async Gen)</th>
+                  <th>OpenClaw (Hook Bus)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>解析模式</strong></td>
+                  <td>物理层解析 Json 碎片</td>
+                  <td>事件驱动订阅 (EventEmitter)</td>
+                </tr>
+                <tr>
+                  <td><strong>触发延迟</strong></td>
+                  <td><strong>Early Start</strong><br>Json 未闭合即尝试预读</td>
+                  <td><strong>Atomic Commit</strong><br>确保块解析完整后分发</td>
+                </tr>
+                <tr>
+                  <td><strong>可观察性</strong></td>
+                  <td>内联在 <code>query.ts</code> 循环中</td>
+                  <td>解耦的 <code>subscribeEmbeddedPiSession</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section id="concurrency">
+            <h2>工具调度逻辑</h2>
+            <div class="key-insight">
+              <strong>并发安全判定：</strong> CC 会动态分类工具副作用。Read/Search 类工具被视为并发安全，全速推进；而 Bash/Write 则被视为独占操作，必须强制串行。
+            </div>
+
+            <p><strong>Bash 级联中止 (Cascading Abort)：</strong> CC 定义了一个特殊的保护机制。一旦 Bash 串行任务失败，系统会通过 <code>siblingAbortController.abort()</code> 立即杀掉所有正在进行的并行读取任务。因为在有状态的 Terminal 中，前置命令失败通常意味着后续环境已失效。</p>
+          </section>
+
+          <section id="recovery">
+            <h2>容错恢复优先级链</h2>
+            <p>当 API 返回 <code>stop_reason</code> 时，并不总是意味着 Loop 结束。系统会按序尝试恢复：</p>
+            <ul>
+              <li><strong>P0: max_output_tokens 溢出</strong> —— 临时提升 <code>max_tokens</code> 到 64k 并注入“Continue”指令。</li>
+              <li><strong>P1: prompt_too_long 溢出</strong> —— 触发 Context Collapse 压缩算法，重新投递。</li>
+              <li><strong>P2: Stop Hooks 触发</strong> —— 调用用户自定义脚本验证结果，决定是否截断。</li>
+            </ul>
+          </section>
+
+          <section id="sources">
+            <h2>关联源码定位</h2>
+            <ul>
+              <li><strong>CC 主循环本体</strong>: <code>query.ts#L241</code> - <code>queryLoop()</code></li>
+              <li><strong>流式工具执行器</strong>: <code>StreamingToolExecutor.ts#L40</code></li>
+              <li><strong>停止判定恢复链</strong>: <code>query.ts#L1062</code></li>
+              <li><strong>OC 事件桥接层</strong>: <code>agents/pi-embedded-subscribe.ts</code></li>
+            </ul>
+          </section>
+
+          <footer>
+            <p>03 Loop Engine Chapter · Claude Code vs OpenClaw Architecture Guide</p>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+  </body>
+</html>

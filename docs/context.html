@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>02 Context：准备送进模型那一包数据</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="docs-container">
+      <aside class="sidebar">
+        <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+        <nav>
+          <ul>
+            <li class="nav-item"><a href="index.html" class="nav-link">00 · 导引</a></li>
+            <li class="nav-item"><a href="index.html#core-loop" class="nav-link">01 · 主循环总图</a></li>
+            <li class="nav-item"><a href="session.html" class="nav-link">01 · Session 边界</a></li>
+            <li class="nav-item"><a href="context.html" class="nav-link active">02 · Context 组装</a></li>
+            <li class="nav-item"><a href="loop-engine.html" class="nav-link">03 · 回合引擎</a></li>
+            <li class="nav-item"><a href="subagent.html" class="nav-link">04 · 子代理/Fork</a></li>
+            <li class="nav-item"><a href="memory.html" class="nav-link">05 · 记忆与收尾</a></li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="main-content">
+        <div class="content-wrapper">
+          <header>
+            <h1>02 Context：送进模型的那一包数据</h1>
+            <p class="epigraph">
+              “每次 API 调用之前，引擎从磁盘上的历史记录到最终送进模型的 messages 数组，中间经历了多少层处理？每一层的存在是为了解决什么问题？”
+            </p>
+          </header>
+
+          <section id="layout">
+            <h2>Context 窗口的物理布局</h2>
+            <p>在讨论“怎么准备”之前，先看 Context 窗口里具体有哪些 Section，以及它们的顺序（<code>prompts.ts#L560</code>）。</p>
+
+            <table>
+              <thead>
+                <tr>
+                  <th>区域</th>
+                  <th>Section 名称</th>
+                  <th>性性</th>
+                  <th>核心内容与源码备注</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td rowspan="4"><strong>静态区</strong><br>(Cached)</td>
+                  <td># Intro / # System</td>
+                  <td>Global Cache</td>
+                  <td>角色定义、安全基线、无限上下文系统公告。</td>
+                </tr>
+                <tr>
+                  <td># Doing tasks</td>
+                  <td>Global Cache</td>
+                  <td>任务执行规范：不要过度开发、安全意识、代码风格。</td>
+                </tr>
+                <tr>
+                  <td># Executing actions</td>
+                  <td>Global Cache</td>
+                  <td>危险操作确认规则：删除文件、Push、PR 需先确认。</td>
+                </tr>
+                <tr>
+                  <td># Using your tools</td>
+                  <td>Global Cache</td>
+                  <td>工具选用优先级：优先专用工具，支持并行调用。</td>
+                </tr>
+                <tr>
+                  <td colspan="4" style="background:#fef2f2; font-family:monospace; text-align:center; color:#b91c1c;">
+                    🔴 __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__
+                  </td>
+                </tr>
+                <tr>
+                  <td rowspan="3"><strong>动态区</strong><br>(Not Cached)</td>
+                  <td># Guidance</td>
+                  <td>Session-specific</td>
+                  <td>工具集相关的即时指令（如 MCP 服务器说明）。</td>
+                </tr>
+                <tr>
+                  <td># Memory</td>
+                  <td>File-specific</td>
+                  <td><strong>CLAUDE.md</strong> 全文注入。</td>
+                </tr>
+                <tr>
+                  <td># Environment</td>
+                  <td>Runtime-specific</td>
+                  <td>CWD、OS 版本、当前使用的模型名称。</td>
+                </tr>
+                <tr>
+                  <td><strong>消息区</strong></td>
+                  <td>Messages[0]</td>
+                  <td>System Reminder</td>
+                  <td><strong>时间戳</strong>、Git Status 摘要、待处理文件列表。</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div class="key-insight">
+              <strong>为什么分左右区？</strong> 边界后的内容每秒都在变。如果把时间戳放在顶部，每次请求都会重新计算 Prompt Cache，导致性能雪崩。物理隔离是缓存命中的前提。
+            </div>
+          </section>
+
+          <section id="pipeline">
+            <h2>Context 准备管道</h2>
+            <div class="mermaid-box">
+              <pre class="mermaid">
+graph LR
+    Disk["💾 磁盘历史"] --> B["Budget 控制<br/>(单次截断)"]
+    B --> M["Microcompact<br/>(内容置换)"]
+    M --> A["AutoCompact<br/>(大脑换芯)"]
+    A --> API["🤖 API 请求"]
+              </pre>
+            </div>
+          </section>
+
+          <section id="layers">
+            <h2>四道降噪防御层</h2>
+            
+            <h3>1. Boundary 隔离：Cache 经济学</h3>
+            <p>使用 <code>__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__</code> 物理隔离静态工具定义与动态环境变量。确保 60KB+ 的静态 Prompt 在整个 Session 中 100% 命中。</p>
+
+            <h3>2. Budget 预算：防止单次爆炸</h3>
+            <p><code>applyToolResultBudget()</code> 会在推理前扫描消息。若单次工具输出（如大文件读取）超过阈值，直接进行物理截断并插入 Tombstone（<code>query.ts#L379</code>）。</p>
+
+            <h3>3. Microcompact：外科手术式置换</h3>
+            <p>不删除消息，而是将过时的 <code>FileRead</code> 结果替换为 <code>[Old content cleared]</code>。通过 <code>Tombstone</code> 机制保留对话骨架但清除冗余体积。</p>
+
+            <h3>4. AutoCompact：全量重构认知</h3>
+            <p>当 Token 触及红线，唤醒轻量级 LLM 对全量历史进行摘要重写，作为新的历史起点。这是处理超长对话的核心防御手段。</p>
+          </section>
+
+          <section id="compare">
+            <h2>架构比较：变量 vs 服务</h2>
+            <div class="key-insight">
+              <strong>Claude Code:</strong> Context 是一个内联管道，通过 <code>Message[]</code> 数组进行直接变换，追求极致性能。<br>
+              <strong>OpenClaw:</strong> Context 是一个抽象服务（<code>ContextEngine</code>），支持通过 Registry 注入自定义 RAG 实现。
+            </div>
+          </section>
+
+          <footer>
+            <p>02 Context Chapter · Claude Code vs OpenClaw Architecture Guide</p>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+  </body>
+</html>

@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>01-Session</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="docs-container">
+    
+    <aside class="sidebar">
+      <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+      <nav>
+        <ul>
+          <li class="nav-item">
+            <a href="index.html" class="nav-link ">00 · 导言</a>
+          </li>
+            <li class="nav-item"><a href="01-session.html" class="nav-link active">01 · Session</a></li>
+          <li class="nav-item"><a href="02-context.html" class="nav-link ">02 · Context</a></li>
+          <li class="nav-item"><a href="03-loop-engine.html" class="nav-link ">03 · Loop Engine</a></li>
+          <li class="nav-item"><a href="04-subagent.html" class="nav-link ">04 · Subagent</a></li>
+          <li class="nav-item"><a href="05-memory.html" class="nav-link ">05 · Memory</a></li>
+
+        </ul>
+      </nav>
+    </aside>
+  
+    <main class="main-content">
+      <div class="content-wrapper markdown-body">
+        <h1>Session：从用户到模型的映射链</h1>
+<h2>核心问题</h2>
+<blockquote>
+<p><strong>&quot;用户觉得自己还在同一次对话里继续聊&quot;这件事，到&quot;模型本轮真正看到的 messages&quot;之间，到底发生了多少次转换？</strong></p>
+</blockquote>
+<p>这个问题看似简单，但答案因产品形态而完全不同。Claude Code 是本地 CLI，用户直接面对一个终端——映射链很短。OpenClaw Agent Runtime 是多通道网关，用户可能从飞书 / Slack / Telegram 进来——映射链很长。<strong>链长链短不是因为谁更先进，而是因为它们面对的问题域不同。</strong></p>
+<pre><code class="language-mermaid">graph TB
+    subgraph &quot;核心问题&quot;
+        U[&quot;👤 用户的直觉&lt;br/&gt;&#39;我还在同一次对话里&#39;&quot;]
+        M[&quot;🤖 模型的输入&lt;br/&gt;&#39;messages 数组&#39;&quot;]
+        U -.-&gt;|&quot;中间发生了什么？&quot;| M
+    end
+</code></pre>
+<hr>
+<h2>概念全景图：Session 世界的完整地图</h2>
+<p>在深入每一层之前，先看一张完整的概念地图。Session 相关的所有概念——多 Agent 路由、会话桶、时间策略、父子 Session、Sub-agent——都在这张图上标出了各自的位置和关系。</p>
+<pre><code class="language-mermaid">graph TB
+    %% 入口层
+    User[&quot;👤 用户&quot;] --&gt;|&quot;在终端/IM 发消息&quot;| Entry{{&quot;入口形态&quot;}}
+    
+    Entry --&gt;|&quot;CLI 终端&quot;| CC_Session[&quot;Claude Code&lt;br/&gt;Session&quot;]
+    Entry --&gt;|&quot;飞书/Slack/Telegram&quot;| IMRoute[&quot;IM 路由层&lt;br/&gt;channel / account / peer / thread&quot;]
+    
+    %% OpenClaw 多 Agent 路由
+    IMRoute --&gt;|&quot;resolveAgentRoute()&quot;| AgentA[&quot;Agent A&quot;]
+    IMRoute --&gt;|&quot;resolveAgentRoute()&quot;| AgentB[&quot;Agent B&quot;]
+    IMRoute --&gt;|&quot;resolveAgentRoute()&quot;| AgentC[&quot;Agent C&quot;]
+    
+    %% 会话桶
+    AgentA --&gt; SK[&quot;sessionKey&lt;br/&gt;（会话桶：direct / group / thread）&quot;]
+    
+    %% 时间策略
+    SK --&gt;|&quot;evaluateSessionFreshness()&quot;| Fresh{{&quot;继续旧 session？&lt;br/&gt;还是新开？&quot;}}
+    Fresh --&gt;|&quot;fresh=true&quot;| OC_Session[&quot;OpenClaw&lt;br/&gt;Session&quot;]
+    Fresh --&gt;|&quot;fresh=false&quot;| OC_NewSession[&quot;新 Session&quot;]
+    
+    %% Session 核心
+    CC_Session --&gt; SessionId[&quot;sessionId&lt;br/&gt;（运行时实例 ID）&quot;]
+    OC_Session --&gt; SessionId
+    OC_NewSession --&gt; SessionId
+    
+    %% 持久化
+    SessionId --&gt; Transcript[&quot;Transcript&lt;br/&gt;（落盘的会话记录）&quot;]
+    
+    %% 上下文工程
+    Transcript --&gt;|&quot;compact / budget / memory 注入&quot;| Messages[&quot;messagesForQuery&lt;br/&gt;模型真正看到的 messages&quot;]
+    
+    %% Sub-agent 分叉
+    SessionId --&gt;|&quot;显式创建子任务&quot;| SubAgent[&quot;Sub-agent Session&lt;br/&gt;（独立上下文 + 父子谱系）&quot;]
+    SubAgent --&gt; SubTranscript[&quot;子 Transcript&quot;]
+    SubTranscript --&gt;|&quot;结果回传父 Session&quot;| Transcript
+    
+    %% 样式
+    style Entry fill:#f5f5f5,stroke:#999
+    style Fresh fill:#f5f5f5,stroke:#999
+    style Messages fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+</code></pre>
+<p><strong>怎么读这张图：</strong></p>
+<ul>
+<li><strong>顶部</strong>是用户入口。CLI 直接进入 Session，IM 先过路由层再进 Session</li>
+<li><strong>中间</strong>是 Session 的核心链路：sessionKey → freshness → sessionId → transcript → messages</li>
+<li><strong>右侧分叉</strong>是 Sub-agent：从父 Session 派生，有独立上下文，结果回传</li>
+<li><strong>绿色高亮</strong>的 <code>messagesForQuery</code> 是终点——所有路径最终都汇入这里</li>
+</ul>
+<p><strong>几个容易混淆的边界：</strong></p>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th align="center">它是不是一个独立的 Session？</th>
+<th>为什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>同一终端继续聊</td>
+<td align="center">否，同一个 Session</td>
+<td>sessionId 不变</td>
+</tr>
+<tr>
+<td><code>/clear</code> 之后</td>
+<td align="center">是，新 Session</td>
+<td>regenerateSessionId() 生成新 ID</td>
+</tr>
+<tr>
+<td><code>/resume</code> 切回旧对话</td>
+<td align="center">是，但切到旧 Session</td>
+<td>switchSession() 恢复旧 ID</td>
+</tr>
+<tr>
+<td>Sub-agent（CC）</td>
+<td align="center">半独立</td>
+<td>同 session 目录下的 sidechain transcript</td>
+</tr>
+<tr>
+<td>Sub-agent（OC）</td>
+<td align="center">独立</td>
+<td>全新的 childSessionKey + sessionId</td>
+</tr>
+<tr>
+<td>同一个 IM 群里的多个 Agent</td>
+<td align="center">各自独立</td>
+<td>resolveAgentRoute() 分发到不同 Agent 的不同 sessionKey</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>两条映射链的对比</h2>
+<p>上面是全景，下面聚焦到<strong>单个用户消息</strong>从发出到进入模型的完整路径：</p>
+<pre><code class="language-mermaid">graph LR
+    subgraph CC[&quot;Claude Code — 短链（4 步）&quot;]
+        direction TB
+        CC1[&quot;用户在终端继续输入&quot;] --&gt; CC2[&quot;当前 sessionId&quot;]
+        CC2 --&gt; CC3[&quot;transcript 文件&lt;br/&gt;sessionId.jsonl&quot;]
+        CC3 --&gt; CC4[&quot;messagesForQuery&lt;br/&gt;（经过 compact/budget 整理）&quot;]
+    end
+
+    subgraph OC[&quot;OpenClaw Agent Runtime — 长链（7 步）&quot;]
+        direction TB
+        OC1[&quot;用户在飞书/Slack 发消息&quot;] --&gt; OC2[&quot;IM 路由层&lt;br/&gt;channel/account/peer/thread&quot;]
+        OC2 --&gt; OC3[&quot;sessionKey&lt;br/&gt;（会话桶）&quot;]
+        OC3 --&gt; OC4[&quot;freshness 判断&lt;br/&gt;（复用旧 session？新开？）&quot;]
+        OC4 --&gt; OC5[&quot;sessionId&lt;br/&gt;（运行时实例）&quot;]
+        OC5 --&gt; OC6[&quot;sessionFile&lt;br/&gt;（transcript tree）&quot;]
+        OC6 --&gt; OC7[&quot;buildSessionContext().messages&lt;br/&gt;（经过 branch/compaction 还原）&quot;]
+    end
+</code></pre>
+<p>每多一步，都是因为<strong>要解决一个 Claude Code 不需要面对的问题</strong>。下面逐层展开。</p>
+<hr>
+<h2>设计解读：每一层解决什么问题</h2>
+<h3>第 1 层：用户的直觉边界</h3>
+<p>两边相同：用户只有一个朴素的直觉——&quot;我还在同一次对话里继续聊&quot;。这是入口，不是模型输入。</p>
+<p>关键区别在于：这个直觉<strong>靠什么维持</strong>？</p>
+<ul>
+<li><strong>Claude Code</strong>：靠终端窗口。窗口开着 = 对话在继续。关窗口或 <code>/clear</code> = 对话结束。用户的直觉和系统边界几乎 1:1 对齐。</li>
+<li><strong>OpenClaw</strong>：靠 IM 的对话容器（一个 DM、一个群聊、一个帖子线程）。但同一个 DM 昨天和今天发的消息，应该当同一次对话吗？这就需要后面的 freshness 层来回答。</li>
+</ul>
+<h3>第 2 层：IM 路由——消息从哪来？</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：同一个用户可能从 3 个不同平台发消息给同一个 Agent，怎么归类？</p>
+</blockquote>
+<p><strong>Claude Code 完全没有这一层。</strong> 它是本地 CLI，不存在&quot;消息从哪个渠道进来&quot;的问题。</p>
+<p><strong>OpenClaw 必须有这层。</strong> <code>resolveAgentRoute()</code> 用 <code>channel / account / peer / thread</code> 这组外部身份，先决定消息属于哪个 Agent，再算出 <code>sessionKey</code>（会话桶）和 <code>mainSessionKey</code>。</p>
+<pre><code class="language-typescript">// openclaw/src/routing/resolve-route.ts#L631
+// 这是链条的起点：先把外部 IM 身份映射成内部的 agent + sessionKey
+const route = resolveAgentRoute({
+  channel,   // 飞书 / Slack / Telegram
+  accountId, // 哪个 bot 账号
+  peer,      // 对话对象（人或群）
+  parentPeer // 帖子的父对话
+})
+</code></pre>
+<p><strong>OC 的 route 匹配有 8 级优先级，从最精确到最宽泛依次尝试</strong>（源码 <code>resolve-route.ts#L749-L808</code>）：</p>
+<table>
+<thead>
+<tr>
+<th align="center">优先级</th>
+<th>匹配维度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="center">1</td>
+<td><code>binding.peer</code></td>
+<td>精确匹配对话对象（某个具体的用户/群）</td>
+</tr>
+<tr>
+<td align="center">2</td>
+<td><code>binding.peer.parent</code></td>
+<td>帖子场景：匹配帖子的父对话</td>
+</tr>
+<tr>
+<td align="center">3</td>
+<td><code>binding.peer.wildcard</code></td>
+<td>匹配某类对话（如所有 direct、所有 group）</td>
+</tr>
+<tr>
+<td align="center">4</td>
+<td><code>binding.guild+roles</code></td>
+<td>Discord 场景：匹配服务器 + 角色</td>
+</tr>
+<tr>
+<td align="center">5</td>
+<td><code>binding.guild</code></td>
+<td>匹配 Discord 服务器</td>
+</tr>
+<tr>
+<td align="center">6</td>
+<td><code>binding.team</code></td>
+<td>匹配 Slack workspace</td>
+</tr>
+<tr>
+<td align="center">7</td>
+<td><code>binding.account</code></td>
+<td>匹配某个 bot 账号</td>
+</tr>
+<tr>
+<td align="center">8</td>
+<td><code>binding.channel</code></td>
+<td>匹配通道（如所有来自 Slack 的消息）</td>
+</tr>
+</tbody></table>
+<p>所有层都没命中 → 使用 <code>default</code> agent。</p>
+<p>这套分层匹配的意义在于：<strong>一个 OpenClaw 实例可以在同一个 Slack workspace 里，不同群指向不同 Agent</strong>。比如 <code>#engineering</code> 群路由到 Code Agent，<code>#support</code> 群路由到 Support Agent——通过 binding 配置，不需要部署多个实例。</p>
+<blockquote>
+<p><strong>设计洞察</strong>：OpenClaw 对 session 的一切复杂性，根源在于它要支持多通道接入。如果只支持一个通道，这一层根本不需要存在。</p>
+</blockquote>
+<h3>第 3 层：会话桶（sessionKey）—— 消息该归到哪类对话？</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：同一个 Agent 下，私聊、群聊、帖子线程怎么隔离？</p>
+</blockquote>
+<p><strong>Claude Code</strong>：没有这一层。一个终端就是一个 session，不存在&quot;归类&quot;。</p>
+<p><strong>OpenClaw</strong>：<code>sessionKey</code> 是一个字符串形式的会话桶 ID。不同的对话场景产出不同形状的 key：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>sessionKey 形状</th>
+<th>为什么这么设计</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>私聊</td>
+<td><code>direct:{peerId}</code></td>
+<td>一对一关系，天然隔离</td>
+</tr>
+<tr>
+<td>群聊</td>
+<td><code>group:{channelId}:{peerId}</code></td>
+<td>同一个群但不同 bot 要分开</td>
+</tr>
+<tr>
+<td>帖子</td>
+<td><code>thread:{parentKey}:{threadId}</code></td>
+<td>帖子是父对话的子分支</td>
+</tr>
+<tr>
+<td>子代理</td>
+<td><code>agent:{agentId}:subagent:{uuid}</code></td>
+<td>子任务需要独立桶</td>
+</tr>
+</tbody></table>
+<pre><code class="language-typescript">// openclaw/src/config/sessions/session-key.ts#L29
+// sessionKey 是外层会话桶，不等于 sessionId，也不等于模型 history
+</code></pre>
+<blockquote>
+<p><strong>设计洞察</strong>：<code>sessionKey</code> 和 <code>sessionId</code> 是两个不同的抽象层。sessionKey 回答&quot;这条消息<strong>该归到哪类对话</strong>&quot;，sessionId 回答&quot;这次<strong>具体恢复哪个运行实例</strong>&quot;。很多对 OpenClaw session 机制的困惑，根源是把这两层混为一谈。</p>
+</blockquote>
+<h3>第 4 层：时间策略（freshness）—— 旧对话还能继续吗？</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：上次聊天是昨天的事了。应该接着聊，还是开新对话？</p>
+</blockquote>
+<p><strong>Claude Code</strong>：<strong>默认没有自动时间切分。</strong> 只靠用户的显式动作：<code>/clear</code> 开新 session，<code>/resume</code> 切回旧 session。这是一个有意的设计选择——作为开发工具，Claude Code 认为<strong>编程任务的边界应该由用户决定</strong>，而不是系统猜测。</p>
+<pre><code class="language-typescript">// claude-code/src/bootstrap/state.ts#L435
+// /clear 时：显式开新 sessionId，旧 session 记为 parent
+export function regenerateSessionId(
+  options: { setCurrentAsParent?: boolean } = {},
+): SessionId {
+  if (options.setCurrentAsParent) {
+    STATE.parentSessionId = STATE.sessionId
+  }
+  STATE.sessionId = randomUUID() as SessionId
+  STATE.sessionProjectDir = null
+  return STATE.sessionId
+}
+</code></pre>
+<p><strong>OpenClaw</strong>：有自动时间策略。<code>evaluateSessionFreshness()</code> 根据 <code>daily</code> 或 <code>idle</code> 来决定同一个 sessionKey 是否继续沿用旧 sessionId。</p>
+<p><strong>两种重置模式的默认值</strong>（源码 <code>reset.ts#L21-22</code>，<code>types.ts#L402</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>行为</th>
+<th>默认值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>daily</code>（默认）</td>
+<td>每天凌晨某个时刻自动切新 session</td>
+<td>凌晨 4 点（<code>DEFAULT_RESET_AT_HOUR = 4</code>）</td>
+</tr>
+<tr>
+<td><code>idle</code></td>
+<td>闲置超过指定分钟后切新 session</td>
+<td>默认不超时（<code>DEFAULT_IDLE_MINUTES = 0</code>）</td>
+</tr>
+</tbody></table>
+<p>也就是说，<strong>OC 的典型默认行为是：同一天内无论间隔多久都继续同一个 session，过了凌晨 4 点之后的第一条消息会自动开新 session</strong>。这个行为可以按会话类型（<code>resetByType</code>）和通道（<code>resetByChannel</code>）分别覆盖。比如测试用例中就有 DM 用 idle 模式（45 分钟超时），群聊用 daily 模式的场景。</p>
+<pre><code class="language-typescript">// openclaw/src/config/sessions/reset.ts#L135-155
+export function evaluateSessionFreshness(params: {
+  updatedAt: number,
+  now: number,
+  policy: SessionResetPolicy
+}): SessionFreshness {
+  // daily 模式：上次活跃时间 &lt; 今天凌晨重置时刻 → stale
+  const staleDaily = dailyResetAt != null &amp;&amp; params.updatedAt &lt; dailyResetAt
+  // idle 模式：当前时间 &gt; 上次活跃 + idle 分钟数 → stale
+  const staleIdle = idleExpiresAt != null &amp;&amp; params.now &gt; idleExpiresAt
+  return { fresh: !(staleDaily || staleIdle) }
+}
+</code></pre>
+<blockquote>
+<p><strong>设计洞察</strong>：这不是&quot;谁对谁错&quot;。Claude Code 面向开发者，任务边界清晰，让人控制。OpenClaw 面向 IM 用户，上下文天然模糊，需要系统自动判断 + 可配置策略。</p>
+</blockquote>
+<h3>第 5 层：运行时 Session（sessionId）—— 具体恢复哪个实例？</h3>
+<p>两边都有 <code>sessionId</code>，但含义的&quot;厚度&quot;不同：</p>
+<ul>
+<li><strong>Claude Code</strong>：<code>sessionId</code> 就是一个 UUID，直接对应一个 transcript 文件名（<code>{sessionId}.jsonl</code>）。获取方式极简——启动时 <code>randomUUID()</code> 生成，<code>/resume</code> 时切到旧的，<code>/clear</code> 时重新生成。</li>
+</ul>
+<pre><code class="language-typescript">// claude-code/src/bootstrap/state.ts#L331
+// 极简的 sessionId：启动时生成，清理时重生，切换时覆盖
+sessionId: randomUUID() as SessionId,
+</code></pre>
+<ul>
+<li><strong>OpenClaw</strong>：<code>sessionId</code> 是经过前面 4 层过滤后得到的运行时实例 ID。它在一个 <code>sessionKey</code> 之下可以轮换（每天一个、闲置超时后换新的），并且还有对应的 <code>SessionEntry</code> 元数据（记录 model / cost / spawnedBy / spawnDepth 等）。</li>
+</ul>
+<blockquote>
+<p><strong>设计洞察</strong>：Claude Code 的 session 状态是&quot;薄&quot;的——几乎就是一个文件指针。OpenClaw 的 session 状态是&quot;厚&quot;的——它携带了路由来源、时间策略、父子谱系、运行参数等丰富的元数据。</p>
+</blockquote>
+<h3>第 6 层：持久化—— 历史写到哪？</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：对话消息怎么落盘？下次还能恢复吗？</p>
+</blockquote>
+<ul>
+<li><strong>Claude Code</strong>：主线程写 <code>{projectDir}/{sessionId}.jsonl</code>，一个线性的 JSONL 文件。子代理不新开外层 session，而是在同一个 session 目录下写 sidechain transcript。</li>
+</ul>
+<pre><code class="language-typescript">// claude-code/src/utils/sessionStorage.ts#L202
+// transcript 路径 = sessionProjectDir + sessionId + .jsonl
+// 子代理 transcript = 同目录下的 sidechain 文件
+</code></pre>
+<p><strong>关键设计</strong>：<code>sessionProjectDir</code> 决定了 transcript 文件在哪个项目目录里。Claude Code 把 session 和<strong>工作目录</strong>绑定——在 <code>~/project-a</code> 启动的对话，历史文件就存在 project-a 的 <code>.claude/</code> 下。这意味着 <strong>session 的认知沙盒就是一个代码项目</strong>。</p>
+<pre><code class="language-typescript">// claude-code/src/bootstrap/state.ts#L456-L478
+// switchSession 时，sessionId 和 sessionProjectDir 原子性地一起切换
+// 注释里明确说了：两个值 always change together，防止不一致
+export function switchSession(
+  sessionId: SessionId,
+  projectDir: string | null = null,
+): void {
+  STATE.sessionId = sessionId
+  STATE.sessionProjectDir = projectDir
+  sessionSwitched.emit(sessionId)
+}
+</code></pre>
+<ul>
+<li><strong>OpenClaw</strong>：分两层——session store 记元数据，sessionFile 记 transcript tree。Pi SDK 的 <code>SessionManager</code> 负责从 tree 结构中还原当前分支的消息链。</li>
+</ul>
+<h3>第 7 层：模型看到的 history —— 终点</h3>
+<blockquote>
+<p><strong>这层解决的问题</strong>：前面 6 层积累的原始记录，不能原样送进模型。要裁剪、压缩、注入 memory。</p>
+</blockquote>
+<ul>
+<li><strong>Claude Code</strong>：<code>messagesForQuery</code>。它不是 transcript 原样，而是经过 <code>applyToolResultBudget</code>（裁剪大工具结果）→ <code>snipCompact</code>（裁剪标记）→ <code>microcompact</code>/<code>autocompact</code>（压缩旧消息）后的结果。</li>
+</ul>
+<pre><code class="language-typescript">// claude-code/src/query.ts#L365
+// 模型真正读的是整理后的 messagesForQuery，不是 transcript 原样
+let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
+</code></pre>
+<ul>
+<li><strong>OpenClaw</strong>：<code>buildSessionContext().messages</code>。Pi SDK 的 <code>SessionManager</code> 会沿当前 leaf 回溯 path，处理 compaction 和 branch_summary，最后产出模型可见消息。</li>
+</ul>
+<blockquote>
+<p><strong>设计洞察</strong>：这一层的存在意味着，<strong>session 的历史和模型的输入永远不是同一个东西</strong>。中间有一整套&quot;上下文工程&quot;在工作——这就是下一章 Context 要深入展开的内容。</p>
+</blockquote>
+<hr>
+<h2>两边怎么做：差异的根本原因</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Claude Code</th>
+<th>OpenClaw Agent Runtime</th>
+<th>差异原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>映射链长度</td>
+<td>4 步</td>
+<td>7 步</td>
+<td>CC 是本地 CLI，不需要 IM 路由和时间策略</td>
+</tr>
+<tr>
+<td>会话边界</td>
+<td>用户显式控制</td>
+<td>系统自动 + 可配置</td>
+<td>开发任务边界清晰 vs IM 上下文天然模糊</td>
+</tr>
+<tr>
+<td>Session 与目录</td>
+<td>绑定（session = 项目）</td>
+<td>解耦（sessionKey 是抽象桶）</td>
+<td>CC 围绕代码项目设计 vs OC 围绕通信设计</td>
+</tr>
+<tr>
+<td>子代理 Session</td>
+<td>sidechain（同目录下的分支文件）</td>
+<td>child session（独立的 sessionKey）</td>
+<td>CC 重本地隔离 vs OC 重 lifecycle 管理</td>
+</tr>
+<tr>
+<td>Session 状态厚度</td>
+<td>薄（一个文件指针）</td>
+<td>厚（路由 + 时间 + 谱系 + 元数据）</td>
+<td>问题域复杂度不同</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>多 Agent 的典型场景</h2>
+<p><strong>Claude Code 的多 Agent</strong>：围绕 subagent 展开。主 Agent 通过 <code>AgentTool</code> 创建子任务，指定 <code>subagent_type</code>（如 <code>code-reviewer</code>）派生独立的子 Agent。子 Agent 从零开始，拿到的是父 Agent 写在 prompt 里的任务描述（相当于&quot;一个新同事走进房间&quot;），有独立的 sidechain transcript。</p>
+<blockquote>
+<p>注：CC 还有一种实验性的 &quot;Forked Agent&quot; 机制（<code>forkSubagent.ts</code>），通过省略 <code>subagent_type</code> 触发隐式 fork，子体继承完整对话上下文。这本质上是一个 <strong>Prompt Cache 优化设计</strong>——让多个 fork 子体共享字节一致的消息前缀以最大化缓存命中。详见 Context 章节。</p>
+</blockquote>
+<p><strong>OpenClaw 的多 Agent</strong>：有两个维度。</p>
+<ul>
+<li><strong>同一实例内的多个 Agent</strong>：通过 <code>bindings</code> 配置，一个 OC 实例可以暴露多个 Agent。不同 Agent 有各自独立的 sessionKey 空间。典型场景：一个 Slack workspace 里，<code>#code-review</code> 频道绑定 Code Agent，<code>#ops</code> 频道绑定 Ops Agent。</li>
+<li><strong>子任务派生（subagent）</strong>：通过 <code>sessions_spawn</code> 工具创建 child session。child 有全新的 <code>childSessionKey = agent:{agentId}:subagent:{uuid}</code>，但通过 <code>spawnedBy</code> / <code>spawnDepth</code> 记录谱系关系。</li>
+</ul>
+<hr>
+<h2>场景演练：同样一句&quot;继续帮我改那个 bug&quot;</h2>
+<p><strong>在 Claude Code 中</strong>：</p>
+<ol>
+<li>用户在终端里打字 → 直接落在当前 sessionId 的 transcript 里</li>
+<li>如果是新开终端，之前的 session 还在 → 用 <code>/resume</code> 切回去</li>
+<li>transcript 经过 compact 整理后 → 变成 <code>messagesForQuery</code> 送进模型</li>
+</ol>
+<p><strong>在 OpenClaw 中</strong>：</p>
+<ol>
+<li>用户在飞书 DM 里发了一句话 → 先过 <code>resolveAgentRoute()</code>，按 8 级优先级匹配到目标 Agent</li>
+<li><code>resolveSessionKey()</code> 算出 sessionKey = <code>direct:{peerId}</code></li>
+<li><code>evaluateSessionFreshness()</code> 发现上次活跃是昨天 → 按 daily 策略（默认凌晨 4 点重置），如果跨天了则开新 session</li>
+<li>拿到 sessionId → 打开 sessionFile → Pi <code>buildSessionContext()</code> 还原 branch</li>
+<li>最终 messages 送进模型</li>
+</ol>
+<p><strong>同一句用户输入，经历了完全不同长度的路径</strong>——但两边最终都到达了同一个终点：一个整理后的 messages 数组。</p>
+<hr>
+<h2>源码定位</h2>
+<h3>Claude Code</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>关键内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/dxxbb/civil-engineering-cloud-claude-code-source-v2.1.88/blob/main/03-claude-code-runnable/src/bootstrap/state.ts#L435">state.ts#L435</a></td>
+<td><code>regenerateSessionId()</code> / <code>switchSession()</code> — session 边界切换</td>
+</tr>
+<tr>
+<td><a href="https://github.com/dxxbb/civil-engineering-cloud-claude-code-source-v2.1.88/blob/main/03-claude-code-runnable/src/utils/sessionStorage.ts#L202">sessionStorage.ts#L202</a></td>
+<td><code>getTranscriptPath()</code> — transcript 文件定位</td>
+</tr>
+<tr>
+<td><a href="https://github.com/dxxbb/civil-engineering-cloud-claude-code-source-v2.1.88/blob/main/03-claude-code-runnable/src/utils/sessionRestore.ts#L409">sessionRestore.ts#L409</a></td>
+<td><code>/resume</code> 切回旧 session</td>
+</tr>
+<tr>
+<td><a href="https://github.com/dxxbb/civil-engineering-cloud-claude-code-source-v2.1.88/blob/main/03-claude-code-runnable/src/query.ts#L365">query.ts#L365</a></td>
+<td><code>messagesForQuery</code> — 模型真正看到的消息</td>
+</tr>
+<tr>
+<td><a href="https://github.com/dxxbb/civil-engineering-cloud-claude-code-source-v2.1.88/blob/main/03-claude-code-runnable/src/commands/clear/conversation.ts#L49">clear/conversation.ts#L49</a></td>
+<td><code>/clear</code> 显式开新 session</td>
+</tr>
+</tbody></table>
+<h3>OpenClaw Agent Runtime</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>关键内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/openclaw/openclaw/blob/main/src/routing/resolve-route.ts#L631">resolve-route.ts#L631</a></td>
+<td><code>resolveAgentRoute()</code> — IM 路由起点</td>
+</tr>
+<tr>
+<td><a href="https://github.com/openclaw/openclaw/blob/main/src/config/sessions/session-key.ts#L29">session-key.ts#L29</a></td>
+<td><code>resolveSessionKey()</code> — 外层会话桶</td>
+</tr>
+<tr>
+<td><a href="https://github.com/openclaw/openclaw/blob/main/src/config/sessions/reset.ts#L135">reset.ts#L135</a></td>
+<td><code>evaluateSessionFreshness()</code> — 时间策略判断</td>
+</tr>
+<tr>
+<td><a href="https://github.com/openclaw/openclaw/blob/main/src/agents/command/session.ts#L44">command/session.ts#L44</a></td>
+<td><code>resolveSession()</code> — 运行时 sessionId 解析</td>
+</tr>
+<tr>
+<td><a href="https://github.com/openclaw/openclaw/blob/main/src/agents/subagent-spawn.ts#L479">subagent-spawn.ts#L479</a></td>
+<td>child session 创建</td>
+</tr>
+</tbody></table>
+<h3>Pi SDK</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>关键内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts#L310">session-manager.ts#L310</a></td>
+<td><code>buildSessionContext()</code> — 从 tree 还原模型可见 messages</td>
+</tr>
+</tbody></table>
+
+      </div>
+    </main>
+  </div>
+  
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      // Convert marked's code blocks to mermaid divs
+      const codeBlocks = document.querySelectorAll('code.language-mermaid');
+      codeBlocks.forEach(block => {
+        const pre = block.parentElement;
+        const div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = block.textContent;
+        pre.parentNode.replaceChild(div, pre);
+      });
+      // Handle blockquotes starting with [!IMPORTANT] etc.
+      const blockquotes = document.querySelectorAll('blockquote');
+      blockquotes.forEach(bq => {
+        const match = bq.innerHTML.match(/\[\!(.*)\]/);
+        if (match) {
+          bq.innerHTML = bq.innerHTML.replace(/\[\!(.*)\]/, '<strong>$1</strong><br/>');
+          bq.classList.add('insight-card');
+        }
+      });
+      
+      mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>03-Loop Engine</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="docs-container">
+    
+    <aside class="sidebar">
+      <a href="index.html" class="sidebar-brand">Agent Loop 导读</a>
+      <nav>
+        <ul>
+          <li class="nav-item">
+            <a href="index.html" class="nav-link ">00 · 导言</a>
+          </li>
+            <li class="nav-item"><a href="01-session.html" class="nav-link ">01 · Session</a></li>
+          <li class="nav-item"><a href="02-context.html" class="nav-link ">02 · Context</a></li>
+          <li class="nav-item"><a href="03-loop-engine.html" class="nav-link active">03 · Loop Engine</a></li>
+          <li class="nav-item"><a href="04-subagent.html" class="nav-link ">04 · Subagent</a></li>
+          <li class="nav-item"><a href="05-memory.html" class="nav-link ">05 · Memory</a></li>
+
+        </ul>
+      </nav>
+    </aside>
+  
+    <main class="main-content">
+      <div class="content-wrapper markdown-body">
+        <h1>Loop Engine：一轮对话里到底发生了多少次推理？</h1>
+<h2>核心问题</h2>
+<blockquote>
+<p><strong>用户发了一条「帮我重构这个模块」，模型在一轮响应里究竟调用了多少次 API，工具是怎么排队执行的，什么时候才算真的「结束」？</strong></p>
+</blockquote>
+<p>这个问题的答案直接决定了 Agent 系统的性能边界和故障模式。Claude Code 和 OpenClaw 对这个问题给出了截然不同的答案——一个选择了<strong>极致的流式并发</strong>，另一个选择了<strong>可组合的重试状态机</strong>。</p>
+<pre><code class="language-mermaid">graph TB
+    subgraph &quot;核心问题&quot;
+        U[&quot;👤 用户发出一条指令&quot;]
+        M[&quot;🔄 Loop Engine 的一轮执行&quot;]
+        R[&quot;✅ 最终响应&quot;]
+        U -..-&gt; |&quot;中间发生了什么？&quot;| M
+        M -..-&gt; R
+    end
+</code></pre>
+<hr>
+<h2>概念全景图：一轮 <code>while(true)</code> 的完整剖析</h2>
+<p>在深入细节之前，先看清楚一轮 Loop 的骨架。两个系统的循环结构高度一致，但在<strong>每一个关键节点</strong>的实现策略上分道扬镳：</p>
+<pre><code class="language-mermaid">stateDiagram-v2
+    [*] --&gt; 上下文准备
+    上下文准备 --&gt; 模型推理 : 投递 messagesForQuery
+    模型推理 --&gt; 流式解析 : 边生成边处理
+    流式解析 --&gt; 工具调度 : 检测到 tool_use 块
+    流式解析 --&gt; 停止条件检查 : 无工具调用
+    工具调度 --&gt; 结果回收 : 工具执行完毕
+    结果回收 --&gt; 上下文准备 : 追加 tool_results，进入下一轮
+    停止条件检查 --&gt; [*] : stop_reason=end_turn
+    停止条件检查 --&gt; 上下文准备 : 异常恢复 / stop_hook 阻断
+</code></pre>
+<p><strong>几个容易混淆的边界：</strong></p>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th align="center">它是一次 API 调用吗？</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>一次「工具调用」</td>
+<td align="center">否</td>
+<td>工具是本地执行的，结果写回消息再发给模型</td>
+</tr>
+<tr>
+<td>一轮「循环迭代」</td>
+<td align="center">是</td>
+<td>每次 <code>while(true)</code> 顶部触发一次新的 API 请求</td>
+</tr>
+<tr>
+<td>AutoCompact 压缩</td>
+<td align="center">是</td>
+<td>会单独触发一次内部 LLM 摘要请求</td>
+</tr>
+<tr>
+<td>用户按 ESC 打断</td>
+<td align="center">否</td>
+<td>Abort 信号注入，不新增 API 调用</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>设计解读：每一层解决什么问题</h2>
+<h3>第 1 层：上下文准备——每轮推理的起点</h3>
+<p>每次循环进入，第一件事是从消息数组中构建本轮的 <code>messagesForQuery</code>。这不是原始 Transcript 的简单复制，而是一套完整的<strong>上下文过滤管道</strong>。</p>
+<p><strong>执行顺序是严格固定的（不可乱序）：</strong></p>
+<pre><code class="language-typescript">// claude-code/src/query.ts#L365-L467
+// 1. 裁剪单条工具结果（防止单个 Bash stdout 撑爆）
+messagesForQuery = await applyToolResultBudget(messagesForQuery, ...)
+
+// 2. Snip：按 token 水位斩断旧历史（保头保尾丢中间）
+messagesForQuery = snipModule.snipCompactIfNeeded(messagesForQuery).messages
+
+// 3. Microcompact：外科手术替换大体积的工具日志为 Tombstone
+messagesForQuery = await deps.microcompact(messagesForQuery, ...).messages
+
+// 4. AutoCompact：如果前三步仍超阈值，唤醒独立 LLM 做完整摘要
+const { compactionResult } = await deps.autocompact(messagesForQuery, ...)
+</code></pre>
+<blockquote>
+<p><strong>设计洞察</strong>：顺序严格的原因在于这四步是<strong>互补而非重叠的</strong>。Microcompact 用 <code>tool_use_id</code> 做精确定位（不读内容），所以必须在 <code>applyToolResultBudget</code> 内容替换之后运行，才能保证两者的缓存键不冲突。如果乱序，缓存会因字节失配而全部失效。</p>
+</blockquote>
+<p>这一层在 OpenClaw 中由 <code>contextEngine.assemble()</code> 封装（详见 <a href="./02-context.md">02-context.md</a>），两边做的事相同，但 OC 通过接口实现了更换底层实现的可能。</p>
+<hr>
+<h3>第 2 层：流式解析——模型推理不是等到最后再读</h3>
+<p>这是 Claude Code 和 OpenClaw 在工程哲学上的<strong>第一个关键分歧</strong>。</p>
+<p><strong>Claude Code：Async Generator + 流式工具执行</strong></p>
+<p>CC 用 <code>async function*</code> 把整个 <code>query()</code> 变成一个 AsyncGenerator。模型的每一个输出块（思考段落、文本、工具调用结构体）都通过 <code>yield</code> 实时推给上层的 UI（Ink 终端渲染器）。</p>
+<p>更激进的是：CC 在模型<strong>还没输出完整的 <code>tool_use</code> JSON</strong>时，就开始并发执行工具——</p>
+<pre><code class="language-typescript">// claude-code/src/services/tools/StreamingToolExecutor.ts#L76-L124
+// 只要检测到 tool_use 块的头部（name 已知），立刻 addTool() 进队列
+addTool(block: ToolUseBlock, assistantMessage: AssistantMessage): void {
+  // ...
+  void this.processQueue()   ← 立刻尝试启动执行
+}
+
+// 在主流式循环的每一帧，都去捞已完成的工具结果
+for (const result of streamingToolExecutor.getCompletedResults()) {
+  yield result.message  ← 工具结果先于模型输出完成而 yield 出来
+}
+</code></pre>
+<p>这意味着当模型还在生成第 3 个工具调用的 JSON 时，第 1 个工具（比如 <code>Bash</code>）可能已经执行完毕并把结果写回消息。这是专为本地 CLI 设计的极致延迟优化——流式生成和工具执行<strong>完全重叠</strong>，用户看到第一条工具输出的时间大幅缩短。</p>
+<p><strong>OpenClaw：<code>subscribeEmbeddedPiSession</code> + Hook 总线</strong></p>
+<p>OC 不使用 Generator，而是通过 <code>subscribeEmbeddedPiSession</code> 注册一系列回调：<code>onPartialReply</code>, <code>onBlockReply</code>, <code>onToolResult</code>。模型输出被转换成事件推入 Hook Runner，由外挂插件订阅。</p>
+<p>这个设计的代价是<strong>无法做流式工具执行</strong>（回调不能中途修改还在推进的流），但换来的是能在 <code>before_compaction</code> / <code>after_compaction</code> 等生命周期节点注入任意业务逻辑——比如在 AutoCompact 前把重要的消息写入外部数据库备份。</p>
+<hr>
+<h3>第 3 层：工具调度——并发还是串行？</h3>
+<p>工具执行是循环的核心 IO 操作，两边的并发策略差异最为显著。</p>
+<p><strong>Claude Code：细粒度并发控制（<code>isConcurrencySafe</code>）</strong></p>
+<p>CC 的 <code>StreamingToolExecutor</code> 把工具分成两类：</p>
+<pre><code class="language-typescript">// claude-code/src/services/tools/StreamingToolExecutor.ts#L129-L135
+private canExecuteTool(isConcurrencySafe: boolean): boolean {
+  const executingTools = this.tools.filter(t =&gt; t.status === &#39;executing&#39;)
+  return (
+    executingTools.length === 0 ||
+    (isConcurrencySafe &amp;&amp; executingTools.every(t =&gt; t.isConcurrencySafe))
+  )
+}
+</code></pre>
+<ul>
+<li><strong>并发安全工具</strong>（<code>isConcurrencySafe = true</code>）：读文件、抓网页——可以全部并行</li>
+<li><strong>独占工具</strong>（<code>isConcurrencySafe = false</code>）：写文件、执行 Bash——必须排队串行</li>
+</ul>
+<p>更关键的是 <strong>Bash 错误的级联中止</strong>：只要一个 Bash 命令出错，<code>siblingAbortController</code> 立刻向所有并行工具发出中止信号——代码里明确保留了 <code>Bash</code> 的特权，因为&quot;mkdir 失败 → 后续命令都没意义&quot;是Bash工具链的隐式依赖特性：</p>
+<pre><code class="language-typescript">// StreamingToolExecutor.ts#L354-L362
+if (tool.block.name === BASH_TOOL_NAME) {
+  this.hasErrored = true
+  this.siblingAbortController.abort(&#39;sibling_error&#39;)  // 取消所有兄弟工具
+}
+</code></pre>
+<p><strong>OpenClaw：通过 <code>pi-coding-agent</code> 的 <code>runTools()</code> 统一调度</strong></p>
+<p>OC 将工具编排交给 Pi SDK 的 <code>runTools()</code> 处理。工具的并发策略由 <code>pi-coding-agent</code> 层面的调度器决定，OC 本身不介入。这使得 OC 更容易接入新的工具类型（只需注册，不需要实现并发安全性判断），但也意味着它放弃了像 CC 那样&quot;Bash 出错级联中止&quot;的精细化控制。</p>
+<hr>
+<h3>第 4 层：停止条件——什么叫「真正结束」？</h3>
+<p>模型返回 <code>end_turn</code> 并非总是意味着循环终止。CC 在 <code>!needsFollowUp</code> 分支里建立了一套精密的<strong>恢复优先级链</strong>：</p>
+<pre><code>end_turn 信号 →
+  1. 检查是否是被扣押的 prompt_too_long？→ 先尝试 Context Collapse drain → 再尝试 ReactiveCompact
+  2. 检查是否是 max_output_tokens 截断？→ 先尝试提升 max_tokens 到 64k → 再注入续写指令最多重试 3 次
+  3. 执行 Stop Hooks（用户自定义脚本）→ 成功则结束 → 阻断则追加错误消息再次循环
+  4. 检查 Token Budget → 如果未达目标则注入&quot;继续&quot;指令
+  5. 真正的 return { reason: &#39;completed&#39; }
+</code></pre>
+<p>这条链的设计原则很清晰：<strong>把所有可以在模型侧恢复的错误，都在循环内部默默处理掉</strong>，避免把中间态暴露给上层 SDK 调用者（否则上层看到 <code>error</code> 字段会直接终止整个 Session）。</p>
+<p><strong>OC 的对应设计</strong>：<code>runEmbeddedPiAgent()</code> 的外层 <code>while(true)</code> 处理的是<strong>运行级别</strong>的重试（认证轮换、Failover 切模型、超时引发的 AutoCompact），而单次 attempt 内部的停止判断委托给 Pi SDK。两层循环的职责清晰分离。</p>
+<hr>
+<h3>第 5 层：异常恢复——循环不崩溃的护盾</h3>
+<p>这是两边差异最具说服力的地方：<strong>CC 的异常处理内嵌在 Generator 循环状态里，OC 的异常处理是外层重试状态机</strong>。</p>
+<p><strong>Claude Code：<code>state = { ..., transition }</code> 携带恢复原因</strong></p>
+<p>CC 的整个 <code>queryLoop</code> 共享一个可变的 <code>State</code> 对象。每次需要「重试」时，不是重新调用函数，而是修改 <code>state</code> 并 <code>continue</code>，让下一次循环迭代从修改后的状态重新开始。<code>state.transition</code> 记录了为什么继续（<code>&#39;max_output_tokens_recovery&#39;</code>, <code>&#39;reactive_compact_retry&#39;</code> 等），主要用于测试断言和防止死循环。</p>
+<pre><code class="language-typescript">// claude-code/src/query.ts#L1231-L1251
+const next: State = {
+  messages: [...messagesForQuery, ...assistantMessages, recoveryMessage],
+  maxOutputTokensRecoveryCount: maxOutputTokensRecoveryCount + 1,
+  transition: { reason: &#39;max_output_tokens_recovery&#39;, attempt: ... },
+  // ...
+}
+state = next
+continue   ← 不是 return，而是继续同一个 while(true)
+</code></pre>
+<p><strong>OpenClaw：外层 <code>runLoopIterations</code> 计数器 + <code>FailoverError</code> 抛出边界</strong></p>
+<p>OC 的外层循环用一个简单的计数器守护：</p>
+<pre><code class="language-typescript">// openclaw/src/agents/pi-embedded-runner/run.ts#L442-L473
+if (runLoopIterations &gt;= MAX_RUN_LOOP_ITERATIONS) {
+  // 超过最大重试次数 → 返回错误响应，不再重试
+  return { payloads: [{ text: &quot;Request failed after repeated internal retries...&quot;, isError: true }] }
+}
+runLoopIterations += 1
+const attempt = await runEmbeddedAttempt(...)
+</code></pre>
+<p>每次 attempt 结果回来后，外层循环检查：是否超时？是否 Context 溢出？是否需要轮换认证 Profile？并决策是否用新参数再调用一次 <code>runEmbeddedAttempt()</code>。<strong>两层循环的边界非常清楚</strong>：<code>runEmbeddedAttempt</code> 处理单次 LLM 交互，<code>runEmbeddedPiAgent</code> 的外层循环处理跨 attempt 的故障转移。</p>
+<hr>
+<h2>两边怎么做：差异的根本原因</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Claude Code</th>
+<th>OpenClaw Agent Runtime</th>
+<th>差异原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>流式处理</td>
+<td>AsyncGenerator，边推边消费</td>
+<td>回调 Hook 总线，事件驱动</td>
+<td>CC 是单终端渲染，OC 是多下游分发</td>
+</tr>
+<tr>
+<td>工具执行时机</td>
+<td><strong>流式并发</strong>：模型未完成即开始执行</td>
+<td>等 attempt 返回后批量执行</td>
+<td>CC 优化本地延迟，OC 优化可观测性</td>
+</tr>
+<tr>
+<td>工具并发控制</td>
+<td>CC 自实现（<code>isConcurrencySafe</code> + 级联中止）</td>
+<td>委托 Pi SDK 的 <code>runTools()</code></td>
+<td>CC 追求精细控制，OC 追求可扩展</td>
+</tr>
+<tr>
+<td>异常恢复粒度</td>
+<td>Generator 内 <code>state.transition</code> 状态机</td>
+<td>外层独立 while 循环 + Failover 抛出</td>
+<td>CC 所有恢复在一个函数内，OC 分层解耦</td>
+</tr>
+<tr>
+<td>循环终止守卫</td>
+<td><code>MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3</code></td>
+<td><code>MAX_RUN_LOOP_ITERATIONS</code></td>
+<td>两边都有断路器，但粒度不同</td>
+</tr>
+<tr>
+<td>Stop Hook 支持</td>
+<td>内置 <code>handleStopHooks()</code>（用户脚本）</td>
+<td>插件 HookRunner（<code>getGlobalHookRunner()</code>）</td>
+<td>同一概念，接入方式不同</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>典型场景演练：「帮我重构这个模块」</h2>
+<p><strong>在 Claude Code 中</strong>，一轮执行可能是：</p>
+<ol>
+<li><code>while(true)</code> 第 1 轮：prepare → 模型开始流式输出 → 检测到 <code>Read(file.ts)</code> 指令 → <strong>StreamingToolExecutor 立刻开始读文件</strong>（同时模型继续生成后续工具调用）→ 读完的结果立刻 yield 给 UI → 全部工具完成 → 追加 <code>tool_results</code> 进 <code>messages</code></li>
+<li><code>while(true)</code> 第 2 轮：带着工具结果的 messages 再次送入模型 → 模型输出修改建议 → <code>end_turn</code> → <code>handleStopHooks()</code> → <code>return { reason: &#39;completed&#39; }</code></li>
+</ol>
+<p><strong>在 OpenClaw 中</strong>，同样的场景是：</p>
+<ol>
+<li>外层 <code>runEmbeddedPiAgent</code> 调用 <code>runEmbeddedAttempt(params)</code></li>
+<li><code>attempt.ts</code> 内部：构建 System Prompt → <code>contextEngine.assemble()</code> 准备消息 → 调用 Pi SDK streaming → 收集工具调用请求 → Pi SDK 的 <code>runTools()</code> 执行工具 → 追加结果 → 再次 LLM → <code>end_turn</code> → <code>contextEngine.afterTurn()</code> 落盘</li>
+<li>结果返回给外层 → 外层检查没有异常 → 返回最终响应</li>
+</ol>
+<p><strong>两边都完成了任务，但 CC 的总延迟更低</strong>（工具和推理重叠），<strong>OC 的生命周期更可观测</strong>（每个 Hook 点都有明确的插入机会）。</p>
+<hr>
+<h2>源码定位</h2>
+<h3>Claude Code</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>关键内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L241">query.ts#L241</a></td>
+<td><code>queryLoop()</code> — 主循环入口，<code>while(true)</code> 在此</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L365">query.ts#L365</a></td>
+<td><code>messagesForQuery</code> 的四步过滤管道（Budget → Snip → Microcompact → AutoCompact）</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L562">query.ts#L562</a></td>
+<td><code>StreamingToolExecutor</code> 初始化，流式工具并发开启时机</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/query.ts#L1062">query.ts#L1062</a></td>
+<td><code>!needsFollowUp</code> 分支：停止条件的完整恢复优先级链</td>
+</tr>
+<tr>
+<td><a href="../03-claude-code-runnable/src/services/tools/StreamingToolExecutor.ts#L40">StreamingToolExecutor.ts#L40</a></td>
+<td>流式并发执行器：<code>isConcurrencySafe</code> 策略 + Bash 级联中止</td>
+</tr>
+</tbody></table>
+<h3>OpenClaw</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>关键内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="../openclaw/src/agents/pi-embedded-runner/run.ts#L441">pi-embedded-runner/run.ts#L441</a></td>
+<td>外层 <code>runLoopIterations</code> 守卫 + <code>runEmbeddedAttempt</code> 调用</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/agents/pi-embedded-runner/run/attempt.ts#L331">pi-embedded-runner/run/attempt.ts#L331</a></td>
+<td><code>runEmbeddedAttempt()</code> — 单次 attempt 的全流程</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/agents/pi-embedded-subscribe.ts">pi-embedded-subscribe.ts</a></td>
+<td><code>subscribeEmbeddedPiSession</code> — 回调 Hook 总线的注册机制</td>
+</tr>
+<tr>
+<td><a href="../openclaw/src/agents/pi-embedded-runner/run.ts#L390">pi-embedded-runner/run.ts#L390</a></td>
+<td><code>resolveContextEngine</code> + AutoCompact 触发路径（overflow / timeout）</td>
+</tr>
+</tbody></table>
+
+      </div>
+    </main>
+  </div>
+  
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      // Convert marked's code blocks to mermaid divs
+      const codeBlocks = document.querySelectorAll('code.language-mermaid');
+      codeBlocks.forEach(block => {
+        const pre = block.parentElement;
+        const div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = block.textContent;
+        pre.parentNode.replaceChild(div, pre);
+      });
+      // Handle blockquotes starting with [!IMPORTANT] etc.
+      const blockquotes = document.querySelectorAll('blockquote');
+      blockquotes.forEach(bq => {
+        const match = bq.innerHTML.match(/\[\!(.*)\]/);
+        if (match) {
+          bq.innerHTML = bq.innerHTML.replace(/\[\!(.*)\]/, '<strong>$1</strong><br/>');
+          bq.classList.add('insight-card');
+        }
+      });
+      
+      mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+    });
+  </script>
+</body>
+</html>
