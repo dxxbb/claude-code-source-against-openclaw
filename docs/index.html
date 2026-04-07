@@ -28,43 +28,43 @@
   
     <main class="main-content">
       <div class="content-wrapper markdown-body">
-        <h1>AI Agent Runtime 架构深度解析</h1>
+        <h1>AI Agent Runtime 架构分析</h1>
         <blockquote>
-          <p>“在工业级场景下，Agent 的可靠性不只取决于模型，更取决于其运行时的设计模式。”</p>
+          <p>“Agent 的系统级表现不仅源于模型能力，更受其运行时（Runtime）架构设计的制约。”</p>
         </blockquote>
-        <p>本项目通过对 Claude Code (CC) 与 OpenClaw (OC) 的源码级比对，系统性地梳理了 AI Agent 在实际运行过程中面临的核心挑战与解决方案。这不仅仅是一份源码审计，更是一场关于“本地化效率”与“分布式扩展”的设计哲学探讨。</p>
+        <p>本项目通过对 Claude Code (CC) 与 OpenClaw (OC) 的源码进行对照分析，解析了 AI Agent 在 Session 管理、Context 处理以及执行流控制等关键环节的设计差异。分析重点在于理解不同的工程约束（如本地 CLI 独立环境与分布式网关环境）如何导向不同的架构方案。</p>
 
-        <h2>专题目录</h2>
-        <p>分析内容按 Agent 调度的生命周期分为以下五个维度，旨在揭示那些被 API 抽象所掩盖的技术细节：</p>
+        <h2>专题分析目录</h2>
+        <p>下述章节按 Agent 调度的生命周期顺序，拆解了各模块的底层实现细节：</p>
         
         <div class="chapter-guide">
           <ul>
             <li>
               <strong><a href="./01-session.html">01 · Session (会话协议)</a></strong>
-              <p>剖析从用户意图到模型 Context 的映射链条。对比单通道 CLI 与多通道网关在会话新鲜度与路由策略上的差异。</p>
+              <p>分析用户意图到模型 Context 的映射过程。对比了单通道 CLI 终端与多通道 IM 路由在会话新鲜度（Freshness）判断与状态迁移上的差异。</p>
             </li>
             <li>
               <strong><a href="./02-context.html">02 · Context (上下文治理)</a></strong>
-              <p>探讨如何通过动态/静态边界、Tombstone 机制以及自动化摘要策略，在保持长周期对话能力的同时优化 Prompt 缓存效率。</p>
+              <p>探讨如何通过动态/静态边界设计、工具日志 Tombstone 机制以及自动化摘要策略，在维持 Token 预算的同时优化缓存命中率。</p>
             </li>
             <li>
               <strong><a href="./03-loop-engine.html">03 · Loop Engine (执行引擎)</a></strong>
-              <p>深入 Loop 底层，拆解流式工具执行的并发控制、级联中止策略以及模型截断后的自动恢复机制。</p>
+              <p>分析单轮对话内部的推理迭代逻辑。对比了 CC 的流式并发工具调配与 OC 的 Hook 驱动模型在延迟控制与生命周期管理上的权衡。</p>
             </li>
             <li>
-              <strong><a href="./04-subagent.html">04 · Subagent (协作架构)</a></strong>
-              <p>解构任务分叉 (Fork) 与派生智能体的生命周期管理，理解如何通过父子谱系实现复杂的排查与执行流。</p>
+              <strong><a href="./04-subagent.html">04 · Subagent (任务并行)</a></strong>
+              <p>解析任务分叉 (Fork) 与派生 Agent 的生命周期。理解如何通过父子谱系以及独立的 Context 空间实现复杂任务的分解执行。</p>
             </li>
             <li>
               <strong><a href="./05-memory.html">05 · Memory (记忆系统)</a></strong>
-              <p>对比“无意识全量注入”与“检索式增强”两种记忆模型。理解 Session Memory 作为 Compaction 补偿机制的设计初衷。</p>
+              <p>对比“触发式全量注入”与“检索式增强”两种记忆模型。分析不同数据规模假设下，Session Memory 与长期记忆巩固（Consolidation）的实现路径。</p>
             </li>
           </ul>
         </div>
 
-        <h2>设计哲学对照</h2>
-        <p>通过对比你会发现，**Claude Code** 的设计核心是“极简与低延迟”，它通过深度耦合本地环境来榨取性能；而 **OpenClaw** 的设计核心是“解耦与扩展”，它通过标准化的接口和 Hook 机制来实现企业级的灵活性。</p>
-        <p>理解这两种截然不同的技术取向，将有助于你在构建自己的 Agent 系统时，做出更符合业务场景的决策。</p>
+        <h2>工程取向对照</h2>
+        <p>分析结果表明，**Claude Code** 的架构设计优先考虑“低延迟交互”与“本地环境集成”，通过紧耦合设计优化了反馈循环；而 **OpenClaw** 的设计则侧重于“多租户解耦”与“跨端扩展”，通过分层抽象（Slots & Plugins）提升了系统的适应能力。</p>
+        <p>这些差异展示了在同一技术栈（LLM Agent）下，不同产品定位对底层架构产生的决定性影响。</p>
 
       </div>
     </main>

@@ -1,43 +1,49 @@
-# AI Agent Runtime 架构研究：Claude Code 与 OpenClaw 的对照分析
+# AI Agent Runtime 架构研究：Claude Code 与 OpenClaw 的源码比对分析
 
-本项目是一个面向 Agent 开发者与系统架构师的源码审计工程。通过对 **Claude Code (CC)** 与 **OpenClaw (OC)** 的底层协议及执行逻辑进行深度拆解，我们试图回答一个核心问题：**在真实的生产环境下，一个高性能、可扩展且具备鲁棒性的 Agent 运行时（Runtime）到底应该如何设计？**
-
----
-
-## 🔬 核心研究价值
-
-当下的 AI 应用开发往往过度依赖模型 API 的调用，而忽略了支撑这些调用的“运行时系统”。通过本项目的源码级比对，我们提炼出了以下核心洞察：
-
-### 1. 会话映射的复杂性 (Session Mapping)
-- **Insight**: 分布式网关 (OC) 的会话映射链条（7步）远比本地 CLI (CC) 的链条（4步）复杂。这揭示了在处理多渠道 IM 接入、会话新鲜度（Freshness）策略以及多 Agent 路由时的架构开销与设计权衡。
-
-### 2. 上下文工程与缓存经济学 (Context Optimization)
-- **Insight**: 剖析 Claude Code 如何通过在 System Prompt 中设置“动静界限 (Dynamic/Static Boundary)”来最大化 Prompt Cache 的命中率，从而在保证 60KB+ 工具 Schema 完整投递的同时，大幅降低 API 成本与延迟。
-
-### 3. 流式工具执行与延迟优化 (Loop Engine)
-- **Insight**: 对比 CC 的“激进流式并发”模式（即模型未输出完整的 JSON 前即开始预执行工具）与 OC 的“事件驱动 Hook 模式”。理解延迟感知型设计与可观测性设计之间的冲突点。
-
-### 4. 记忆系统的体量假设 (Memory Philosophy)
-- **Insight**: 探讨“无意识全量注入 (CC)”与“有意识向量检索 (OC)”背后的数据规模假设。理解为什么不同场景下对“记忆”的持久化与 Consolidation 策略会有本质的区别。
+本项目通过对 Claude Code (v0.2.29) 与 OpenClaw 的源码实现进行对照分析，解析了 AI Agent 在 Session 管理、Context 治理、Loop 执行引擎等核心环节的技术决策。文档重点讨论了不同工程约束（单机 CLI 终端 vs. 分布式多通道网关）对 Agent 运行时设计的具体影响。
 
 ---
 
-## 📂 文档导读
+## 🔬 架构分析维度
 
-所有的分析心得已按 Agent 调度的生命周期整理为以下五个专题：
+文档从以下四个维度出发，拆解了 Agent 运行时的底层逻辑实现：
 
-| 章节 | 核心解析点 | 在线阅读 (GitHub Pages) |
+### 1. 会话记录转换 (Session Transformation)
+分析了消息从用户输入映射到模型 Message 数组的全过程。对比了 Claude Code 的短链结构（4 步）与 OpenClaw 在处理 IM 路由、会话新鲜度（Freshness）及路由分发时的长链结构（7 步），揭示了多通道接入带来的架构开销。
+
+### 2. 上下文与缓存优化 (Context & Cache)
+讨论了 Claude Code 如何通过在 System Prompt 中设置缓存分界线（Dynamic/Static Boundary）来提升 Prompt Cache 的利用率，以及 OpenClaw 如何通过可插拔的 `ContextEngine` 接口实现灵活的上下文裁剪与 Token 预算（Budget）管理。
+
+### 3. 执行循环模式 (Loop Engine)
+比对了两种不同的执行流模式：Claude Code 采用的异步生成器（AsyncGenerator）与流式并发工具执行（降低首字延迟）；以及 OpenClaw 基于事件驱动的回调机制，用于支持更复杂的生命周期钩子（Hooks）。
+
+### 4. 记忆系统的应用假设 (Memory Patterns)
+探讨了基于全量注入（Total Injection）的本地记忆方案与基于向量检索（Vector Search）的共享记忆方案。分析了数据规模（Data Scale）假设如何直接影响 Memory Slot 的设计与其 Consolidation（巩固）策略。
+
+---
+
+## 📂 文档目录
+
+分析心得已按功能模块整理为五个专题文件：
+
+| 专题 | 分析重点 | 在线阅读 (GitHub Pages) |
 | :--- | :--- | :--- |
-| **01 · Session** | 用户直觉到模型消息的映射全过程 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/01-session.html) |
-| **02 · Context** | 静态/动态分界、Tombstone 机制与自动摘要策略 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/02-context.html) |
-| **03 · Loop** | 推理轮询、并发工具调度与错误自动恢复优先级 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/03-loop-engine.html) |
-| **04 · Subagent** | 任务分叉 (Fork)、上下文隔离与结果回传谱系 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/04-subagent.html) |
-| **05 · Memory** | 会话记忆、持久化提炼与周期性巩固 (Consolidation) | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/05-memory.html) |
+| **01 · Session** | 多通道路由映射与会话状态迁移 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/01-session.html) |
+| **02 · Context** | 缓存分区设计与工具日志的预算管理策略 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/02-context.html) |
+| **03 · Loop** | 轮询执行、流式并发与错误自动恢复机制 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/03-loop-engine.html) |
+| **04 · Subagent** | 任务分叉、上下文隔离隔离及结果回传谱系 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/04-subagent.html) |
+| **05 · Memory** | 记录提炼、异步巩固与 Session Memory 补偿设计 | [阅读文档](https://dxxbb.github.io/claude-code-source-against-openclaw/05-memory.html) |
 
 ---
 
-## 🛠️ 关于本项目
+## 🛠️ 项目说明
 
-本项目并非这两个工具的官方文档，而是一份基于 **Claude Code (v0.2.29)** 和 **OpenClaw (v1.x)** 源码的独立审计分析。你可以直接阅读 `docs/` 下的源文件，或通过 `node build.js` 在本地重新生成 HTML 文档。
+本仓库包含 Claude Code 与 OpenClaw 的精简源码副本，分析内容为基于源码的独立技术研究结论。你可以在本地运行以下脚本以重新生成 HTML 版文档：
 
-> “在架构师的眼中，没有魔法。Agent 的智慧只是无数条件检查、上下文修剪与树状分支的排列组合。”
+```bash
+cd docs
+npm install
+node build.js
+```
+
+> 技术分析应当剥开概念的外壳。Agent 架构的本质在于对条件判断、上下文裁剪以及执行流序列的分层治理。
