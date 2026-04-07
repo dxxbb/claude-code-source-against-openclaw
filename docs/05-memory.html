@@ -72,10 +72,14 @@ const DEFAULT_SLOT_BY_KEY = {
 <p>Session Memory 的存在本身就揭示了一个深层问题：<strong>Compaction（对话压缩）是有损的，而且损失不可预测</strong>。</p>
 <p>如果 compaction 能完美保留所有重要信息，Session Memory 就没有存在的必要。但现实是，LLM 做摘要时不知道&quot;用户后面还会不会用到这个细节&quot;——它只能猜。Session Memory 的设计本质上是承认了这一点：与其指望 compaction 能猜对，不如<strong>在压缩前就把可能重要的信息单独保存一份</strong>，压缩后再注入回去。</p>
 <p>这是一个典型的<strong>预写日志（WAL）模式</strong>——先写到安全的地方，再让危险操作（compaction）发生。</p>
-<p>触发条件（<code>sessionMemory.ts#L134-181</code>）：token 增长超阈值 + tool call 次数超阈值，或 token 超阈值 + 本轮没 tool call（自然断点）。作用域仅限当前对话。</p>
+<p><strong>触发条件（<code>sessionMemory.ts#L134-181</code>）</strong>：</p>
+<ol>
+<li><strong>Token 增长超阈值</strong> (<code>minimumTokensBetweenUpdate</code>) 且 <strong>Tool Call 次数超阈值</strong>。</li>
+<li><strong>Token 增长超阈值</strong> 且 <strong>当前回合无 Tool Call</strong>（利用自然断点，防止在频繁工具调用中打断逻辑）。<br>作用域仅限当前对话。</li>
+</ol>
 <h3>第 2 层：extractMemories — 写入优化的&quot;L0 层&quot;</h3>
 <p>每次 query loop 结束后（模型给出最终回复），系统用 forked agent 扫描本轮对话，提炼出项目知识，写入 <code>~/.claude/projects/&lt;path&gt;/memory/*.md</code>。下一次对话启动时全量注入 system prompt。</p>
-<p>这里有一个容易忽略的设计选择：<strong>extractMemories 每次都是独立写入，不去管之前已有的 memory 文件</strong>。它只看&quot;本轮对话有什么值得记住的&quot;，然后追加。这意味着 memory 文件会随时间增长、出现重复甚至矛盾——这就是为什么需要第 3 层 AutoDream。</p>
+<p>这里有一个关键的设计细节：<strong>extractMemories 在写入前会读取现有 memory 的文件清单（manifest）</strong>。Subagent 被明确指令“优先更新已有文件而非创建重复”（<code>prompts.ts#L32</code>）。它是主动的项目知识维护系统，而不仅是碎片的追加。</p>
 <p>这个模式跟数据库的 <strong>LSM-tree</strong> 非常像：extractMemories 是 L0 层的快速写入（小文件、追加式、不去重），AutoDream 是 compaction（周期性合并、去重、重组织）。设计者有意选择了<strong>写入优化而非读取优化</strong>——因为 memory 的写入频率（每轮 query 一次）远高于读取频率（每次新对话一次），而且读取时是全量注入不需要随机访问。</p>
 <h3>第 3 层：AutoDream — 成本驱动的周期性整合</h3>
 <p>AutoDream 是 LSM-tree 类比中的 compaction 操作：周期性合并 extractMemories 写入的碎片文件。但它也是三层 memory 中最昂贵的——需要读取多个 session 的 transcript，用一次完整 LLM 调用整合。所有三层 memory 服务都依赖 forked agent，<strong>每次运行都消耗真实的 API tokens</strong>。</p>
@@ -178,8 +182,10 @@ const DEFAULT_SLOT_BY_KEY = {
 <ul>
 <li><strong><code>memory_search</code></strong>：向量检索——Agent 可以按语义搜索过去的记忆</li>
 <li><strong><code>memory_get</code></strong>：精确获取——按 key 读取特定记忆条目</li>
-<li><strong><code>memory_upsert</code></strong>：写入——Agent 主动保存新的记忆</li>
 </ul>
+<blockquote>
+<p>[!WARNING]<br><strong>写入逻辑由系统接管</strong>：与 CC 的 extractMemories 类似，OC 的 Agent 通常不直接通过工具“保存”记忆。主要的写入逻辑发生在 <strong>Memory Flush</strong> 阶段。</p>
+</blockquote>
 <p>底层存储后端默认为 <code>builtin</code>（源码 <code>memory-state.ts#L45-52</code>）：</p>
 <pre><code class="language-typescript">type MemoryRuntimeBackendConfig =
   | { backend: &quot;builtin&quot; }     // ← 默认：本地 embedding + 文件
