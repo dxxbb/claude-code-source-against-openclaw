@@ -107,6 +107,33 @@ body {
   font-weight: 600;
 }
 
+.nav-divider {
+  margin: 16px 12px;
+  border: none;
+  border-top: 1px solid var(--border-color);
+  opacity: 0.6;
+}
+
+.nav-external {
+  list-style: none;
+  padding-top: 8px;
+}
+
+.nav-github {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+}
+
+.nav-github svg {
+  opacity: 0.7;
+}
+
+.nav-github:hover svg {
+  opacity: 1;
+}
+
 .main-content {
   flex-grow: 1;
   padding: 64px 48px;
